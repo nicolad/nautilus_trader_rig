@@ -64,7 +64,12 @@ async fn main() -> Result<()> {
 
     // 4. Create a DeepSeek client (reads config from environment)
     let client = openai::Client::from_url("ollama", "http://localhost:11434/v1");
-    let model = client.embedding_model("bge-m3");
+
+    /**
+     * https://github.com/0xPlaygrounds/rig/blob/main/rig-core/examples/rag_ollama.rs#L29
+     * https://ollama.com/library/nomic-embed-text
+     *  */
+    let model = client.embedding_model("nomic-embed-text");
 
     // 5. Build embeddings for all code snippets
     let mut builder = EmbeddingsBuilder::new(model.clone());
