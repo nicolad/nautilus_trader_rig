@@ -1062,6 +1062,7 @@ dependencies = [
  "git2",
  "rig-core",
  "serde",
+ "sqlite-vec",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1583,6 +1584,15 @@ checksum = "4f5fd57c80058a56cf5c777ab8a126398ece8e442983605d280a44ce79d0edef"
 dependencies = [
  "libc",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "sqlite-vec"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ec77b84fb8dd5f0f8def127226db83b5d1152c5bf367f09af03998b76ba554a"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
