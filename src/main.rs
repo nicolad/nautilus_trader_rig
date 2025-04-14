@@ -3,8 +3,7 @@ use dotenv::dotenv;
 use git2::{Repository, TreeWalkMode, TreeWalkResult};
 use rig::{
     embeddings::{Embed, EmbedError, EmbeddingsBuilder, TextEmbedder},
-    providers::openai::{Client as OpenAIClient, TEXT_EMBEDDING_ADA_002},
-    vector_store::VectorStoreIndex,
+    providers::openai::{Client, TEXT_EMBEDDING_ADA_002},
 };
 use rig_sqlite::{Column, ColumnValue, SqliteVectorStore, SqliteVectorStoreTable};
 use rusqlite::ffi::sqlite3_auto_extension;
@@ -140,7 +139,7 @@ async fn main() -> Result<()> {
     // 4. Build embeddings with OpenAI
     let openai_api_key = env::var("OPENAI_API_KEY")
         .expect("Expected OPENAI_API_KEY in environment variables");
-    let openai_client = OpenAIClient::new(&openai_api_key);
+    let openai_client = Client::new(&openai_api_key);
     let model = openai_client.embedding_model(TEXT_EMBEDDING_ADA_002);
 
     info!("Building embeddings with OpenAI (text-embedding-ada-002)");
@@ -209,14 +208,6 @@ async fn main() -> Result<()> {
     let index = vector_store.index(model.clone());
     info!("Vector store indexed. Ready for queries.");
 
-    // 10. Example query
-    info!("Querying the vector store for 'moving average implementation'");
-    let results = index
-        .top_n::<CodeChunk>("moving average implementation", 3)
-        .await?;
-    for (score, doc_id, chunk) in results {
-        println!("Score: {score}, ID: {doc_id}, Path: {}", chunk.file_path);
-    }
 
     // 11. Optional: Summaries
     {
