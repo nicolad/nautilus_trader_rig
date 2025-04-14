@@ -80,10 +80,12 @@ async fn main() -> Result<()> {
 
     // 1. Open local Git repo
     let repo_path = "./nautilus_trader";
+    info!("Attempting to open repository at: {}", repo_path);
     let repo = Repository::open(repo_path)?;
     info!("Repository opened successfully: {:?}", repo_path);
 
     // 2. Get the latest commit from the local 'develop' branch
+    info!("Looking for branch: 'develop'");
     let branch = repo.find_branch("develop", git2::BranchType::Local)?;
     let commit = branch.get().peel_to_commit()?;
     let tree = commit.tree()?;
@@ -106,25 +108,28 @@ async fn main() -> Result<()> {
     let re_rust_indicator =
         Regex::new(r"(?i)pub\s+struct\s+([A-Za-z_]\w*Indicator)\s*\{").unwrap();
 
-    // Walk the entire repo tree recursively
+    // We'll define a closure that processes the entries in the git tree
     let walker_callback = |root: &str, entry: &git2::TreeEntry| {
         let Ok(obj) = entry.to_object(&repo) else {
+            info!("Skipping entry because we couldn't convert to object: {:?}", entry.name());
             return TreeWalkResult::Ok;
         };
 
+        // We'll log the type (Tree vs Blob vs something else)
         match obj.kind() {
             Some(ObjectType::Tree) => {
-                // It's a sub-tree (directory). Keep walking in PreOrder.
+                // It's a sub-tree (directory).
                 let dir_name = entry.name().unwrap_or_default();
-                info!("Descending into subfolder: {}{}", root, dir_name);
+                let full_dir_path = format!("{}{}", root, dir_name);
+                info!("Descending into subfolder: {full_dir_path}");
                 TreeWalkResult::Ok
             }
             Some(ObjectType::Blob) => {
-                // It's a file. Let’s see if it's .py / .pyx / .pxd / .rs / .r
+                // It's a file. Let’s see if it ends with .py / .pyx / .pxd / .rs / .r
                 let file_name = entry.name().unwrap_or_default();
                 let file_path = format!("{}{}", root, file_name);
+                info!("Found file: {file_path}");
 
-                // If you only need .rs, remove the .r check
                 let extension = if file_path.ends_with(".py") {
                     "python"
                 } else if file_path.ends_with(".pyx") || file_path.ends_with(".pxd") {
@@ -135,10 +140,17 @@ async fn main() -> Result<()> {
                     "unknown"
                 };
 
-                if extension != "unknown" {
-                    if let Some(blob) = obj.as_blob() {
-                        if let Ok(file_str) = std::str::from_utf8(blob.content()) {
-                            // We store the entire snippet for embedding
+                if extension == "unknown" {
+                    info!("Skipping file with unknown extension: {file_path}");
+                    return TreeWalkResult::Ok;
+                }
+
+                // Attempt to retrieve the blob content
+                if let Some(blob) = obj.as_blob() {
+                    // Convert raw bytes to str
+                    match std::str::from_utf8(blob.content()) {
+                        Ok(file_str) => {
+                            // We'll collect the code snippet
                             code_snippets.push(CodeChunk {
                                 id: format!("{}::{}", commit.id(), file_path),
                                 content: file_str.to_string(),
@@ -146,12 +158,10 @@ async fn main() -> Result<()> {
                                 file_path: file_path.clone(),
                             });
 
+                            info!("Processing file: {file_path}, extension: {extension}, lines: {}", file_str.lines().count());
+
                             // Now search for indicator definitions
                             let lines: Vec<&str> = file_str.lines().collect();
-                            info!(
-                                "Processing file: {}, extension: {}, lines: {}",
-                                file_path, extension, lines.len()
-                            );
                             let mut found_any_match = false;
 
                             match extension {
@@ -167,8 +177,7 @@ async fn main() -> Result<()> {
                                             ));
                                             info!(
                                                 "  [MATCH] line {} => Found Python indicator: {}",
-                                                i,
-                                                indicator_name
+                                                i, indicator_name
                                             );
                                             found_any_match = true;
                                         }
@@ -186,8 +195,7 @@ async fn main() -> Result<()> {
                                             ));
                                             info!(
                                                 "  [MATCH] line {} => Found Cython indicator: {}",
-                                                i,
-                                                indicator_name
+                                                i, indicator_name
                                             );
                                             found_any_match = true;
                                         }
@@ -205,28 +213,41 @@ async fn main() -> Result<()> {
                                             ));
                                             info!(
                                                 "  [MATCH] line {} => Found Rust indicator: {}",
-                                                i,
-                                                indicator_name
+                                                i, indicator_name
                                             );
                                             found_any_match = true;
                                         }
                                     }
                                 }
-                                _ => {}
+                                _ => {
+                                    // Shouldn't happen, but just in case
+                                }
                             }
 
                             if !found_any_match {
                                 info!("  No indicator matches found in {}", file_path);
                             }
                         }
+                        Err(e) => {
+                            info!("Skipping file (UTF-8 error): {} => {}", file_path, e);
+                        }
                     }
+                } else {
+                    info!("Object is not a blob: {file_path}");
                 }
+
                 TreeWalkResult::Ok
             }
-            _ => TreeWalkResult::Ok,
+            other => {
+                // Could be a commit, tag, etc. We'll skip
+                info!("Skipping object of type {:?} at entry: {:?}", other, entry.name());
+                TreeWalkResult::Ok
+            }
         }
     };
 
+    // Now perform the actual recursive walk of the tree
+    info!("Starting recursive tree walk...");
     tree.walk(TreeWalkMode::PreOrder, walker_callback)?;
 
     info!("Collected {} code snippets", code_snippets.len());
@@ -236,6 +257,7 @@ async fn main() -> Result<()> {
     {
         let mut csv_file =
             BufWriter::new(File::create("indicators.csv").expect("create indicators.csv failed"));
+        // Header
         writeln!(csv_file, "filename,indicator_name,extension")?;
         for (path, name, ext) in &indicators {
             writeln!(csv_file, "{},{},{}", path, name, ext)?;
@@ -268,7 +290,8 @@ async fn main() -> Result<()> {
             let rows = stmt.query_map(params![], |row| row.get::<_, String>(0))?;
             let mut found = HashSet::new();
             for row_result in rows {
-                found.insert(row_result?);
+                let the_id = row_result?;
+                found.insert(the_id);
             }
             Ok(found)
         })
@@ -284,18 +307,25 @@ async fn main() -> Result<()> {
 
     info!("{} new code snippets to store", new_snippets.len());
 
-    // ---- BATCHING LOGIC HERE ----
+    // ---- BATCHING LOGIC ----
     const BATCH_SIZE: usize = 50;
     let mut total_embedded = 0;
+    if new_snippets.is_empty() {
+        info!("No new snippets to embed. Skipping embedding step.");
+    } else {
+        info!("Beginning embedding in batches of {} documents each.", BATCH_SIZE);
+    }
 
-    for chunk in new_snippets.chunks(BATCH_SIZE) {
+    for (batch_index, chunk) in new_snippets.chunks(BATCH_SIZE).enumerate() {
+        info!("Embedding batch #{} with {} documents...", batch_index + 1, chunk.len());
+
         let mut builder = EmbeddingsBuilder::new(model.clone());
         for snippet in chunk {
             builder = builder.document(snippet.clone())?;
         }
-        // Build embeddings for this subset
+
         let embeddings = builder.build().await?;
-        info!("Batch of {} docs embedded successfully. Storing in DB...", chunk.len());
+        info!("Batch #{} embedded successfully, storing in DB...", batch_index + 1);
 
         vector_store.add_rows(embeddings).await?;
         total_embedded += chunk.len();
@@ -346,7 +376,6 @@ async fn main() -> Result<()> {
             .call(|inner_conn| {
                 let mut stmt = inner_conn.prepare("SELECT id FROM code_chunks")?;
                 let rows = stmt.query_map(params![], |row| row.get::<_, String>(0))?;
-
                 let mut v = Vec::new();
                 for row_result in rows {
                     v.push(row_result?);
@@ -374,7 +403,6 @@ async fn main() -> Result<()> {
             .call(|inner_conn| {
                 let mut stmt = inner_conn.prepare("SELECT id FROM code_chunks")?;
                 let rows = stmt.query_map(params![], |row| row.get::<_, String>(0))?;
-
                 let mut v = Vec::new();
                 for row_result in rows {
                     v.push(row_result?);

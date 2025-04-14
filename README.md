@@ -27,35 +27,6 @@
 
 ---
 
-## Flow Diagram
-
-```mermaid
-flowchart TB
-    A((Start)) --> B[Initialize tracing/logging and load environment (.env)]
-    B --> C[Open local Git repository (branch = develop)]
-    C --> D[Get latest commit tree from 'develop']
-    D --> E[Walk all files in repo tree (PreOrder)]
-    E --> F{File extension .py/.pyx/.pxd/.rs/.r?}
-    F -->|Yes| G[Extract file content & store as CodeChunk]
-    G --> H[Check for indicator definitions]
-    H --> I{Indicator match?}
-    I -->|Yes| J[Collect indicator name & path]
-    I -->|No| K[Continue walking other files]
-    J --> K[Keep scanning next lines]
-    F -->|No| K
-
-    K --> L[Write discovered indicators to indicators.csv]
-    L --> M[Generate embeddings via OpenAI (text-embedding-ada-002)]
-    M --> N[Initialize & connect to local SQLite DB]
-    N --> O[Check existing snippet IDs to avoid duplicates]
-    O --> P[Store new snippet embeddings & code metadata in DB]
-    P --> Q[Build vector index for retrieval (RAG)]
-    Q --> R[Use LLM to compare Rust vs. Python indicators]
-    R --> S[Save generated comparison table to README_comparison.md]
-    S --> T[Write snippet summaries to .txt and .md files]
-    T --> U((Done))
-```
-
 ## Code Explanation
 
 ### 1. Logging & Environment Setup
