@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
-use git2::{ObjectType, Repository};
+use git2::Repository;
 use rig::{
-    Embed, embeddings::EmbeddingsBuilder, providers::openai,
+    Embed, completion::Prompt, embeddings::EmbeddingsBuilder, providers::ollama::Client,
     vector_store::in_memory_store::InMemoryVectorStore,
 };
 use serde::{Deserialize, Serialize};
+use tracing::{debug, error, info};
 
 #[derive(Embed, Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 struct CodeChunk {
@@ -17,93 +18,123 @@ struct CodeChunk {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 1. Open a local Git repository
-    let remote_url = "https://github.com/nautechsystems/nautilus_trader";
-    let tmp_path = std::env::temp_dir().join("nautilus_trader");
-    let repo = Repository::clone(remote_url, &tmp_path)
-        .with_context(|| format!("Failed to clone repo from {remote_url}"))?;
+    // Initialize tracing subscriber for logging
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_thread_ids(true)
+        .with_thread_names(true)
+        .with_level(true)
+        .init();
 
-    // 2. Read HEAD commit & tree
-    let head = repo.head()?.peel(ObjectType::Commit)?;
-    let commit = head.as_commit().expect("HEAD is not a commit");
-    let tree = commit.tree()?;
+    info!("Starting RAG agent setup");
 
-    // 3. Walk the files in the tree, collect them as CodeChunk structs
+    // 1. Open a local Git repository (already cloned manually)
+    let repo_path = "./nautilus_trader";
+    debug!("Opening repository at {}", repo_path);
+
+    let repo = Repository::open(repo_path)
+        .with_context(|| format!("Failed to open local repo at {repo_path}"))?;
+    info!("Repository opened successfully");
+
+    // 2. Get the latest commit from the local 'develop' branch
+    debug!("Finding 'develop' branch");
+    let branch = repo
+        .find_branch("develop", git2::BranchType::Local)
+        .context("Failed to find 'develop' branch locally")?;
+
+    debug!("Peeling branch to commit");
+    let commit = branch
+        .get()
+        .peel_to_commit()
+        .context("Failed to peel 'develop' branch to a commit")?;
+
+    let tree = commit.tree().context("Failed to read tree from commit")?;
+    info!("Got tree from latest commit: {}", commit.id());
+
+    let indicators_path_prefix = "nautilus_trader/indicators";
     let mut code_snippets = Vec::new();
-    tree.walk(git2::TreeWalkMode::PreOrder, |_, entry| {
-        if let Some(obj) = entry.to_object(&repo).ok() {
-            if obj.as_tree().is_none() {
-                // It's a file (blob)
-                if let Some(blob) = obj.as_blob() {
-                    // Convert file contents to string
-                    if let Ok(file_str) = std::str::from_utf8(blob.content()) {
-                        // Basic heuristic: check if file is .py or .rs
-                        if let Some(name) = entry.name() {
-                            let language = if name.ends_with(".py") {
-                                "python"
-                            } else if name.ends_with(".rs") {
-                                "rust"
-                            } else {
-                                "unknown"
-                            };
-                            let id = format!("{}::{}", commit.id(), name);
 
+    tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+        if let Some(obj) = entry.to_object(&repo).ok() {
+            if let Some(blob) = obj.as_blob() {
+                let file_path = format!("{}{}", root, entry.name().unwrap_or_default());
+                if file_path.starts_with(indicators_path_prefix) {
+                    if let Ok(file_str) = std::str::from_utf8(blob.content()) {
+                        let language = if file_path.ends_with(".py") {
+                            "python"
+                        } else if file_path.ends_with(".rs") {
+                            "rust"
+                        } else if file_path.ends_with(".pyx") || file_path.ends_with(".pxd") {
+                            "cython"
+                        } else {
+                            "unknown"
+                        };
+
+                        if language != "unknown" {
+                            let id = format!("{}::{}", commit.id(), file_path);
                             code_snippets.push(CodeChunk {
                                 id,
                                 content: file_str.to_string(),
                                 language: language.to_string(),
-                                file_path: name.to_string(),
+                                file_path: file_path.clone(),
                             });
+                            debug!("Included indicator: {}", file_path);
                         }
                     }
+                } else {
+                    debug!("Skipped file: {}", file_path);
                 }
             }
         }
         git2::TreeWalkResult::Ok
     })?;
 
-    // 4. Create a DeepSeek client (reads config from environment)
-    let client = openai::Client::from_url("ollama", "http://localhost:11434/v1");
+    info!("Collected {} code snippets", code_snippets.len());
 
-    // https://github.com/0xPlaygrounds/rig/blob/main/rig-core/examples/rag_ollama.rs#L29
-    // https://ollama.com/library/nomic-embed-text
+    // 4. Create an Ollama-based client for embeddings
+    info!("Creating Ollama client for embeddings");
+    let client = Client::new();
     let model = client.embedding_model("nomic-embed-text");
 
     // 5. Build embeddings for all code snippets
+    info!("Building embeddings");
     let mut builder = EmbeddingsBuilder::new(model.clone());
-    for snippet in code_snippets {
-        builder = builder.document(snippet)?;
+    for snippet in &code_snippets {
+        debug!(
+            "Adding snippet to embeddings builder: {}",
+            snippet.file_path
+        );
+        builder = builder.document(snippet.clone())?;
     }
-
-    // 6. Actually build the embeddings (await directly in async context)
     let embeddings = builder.build().await?;
+    info!("Embeddings built successfully");
 
-    // 7. Create vector store and an index
+    // 6. Create an in-memory vector store and index
+    info!("Creating in-memory vector store");
     let vector_store = InMemoryVectorStore::from_documents(embeddings);
-    let index = vector_store.index(model);
+    let index = vector_store.index(model.clone());
+    info!("Vector store created and indexed");
 
-    // 8. Build a RAG agent
+    // 7. Build a RAG agent
+    info!("Building RAG agent");
     let rag_agent = client
-        .agent("indicator_parity_checker")
+        .agent("qwen2.5:14b")
         .preamble(
-            "You are an assistant that compares Python vs. Rust code in this repository. \
-             Summarize differences in a markdown table if asked.",
+            "
+            You are an assistant that compares Python vs. Rust code in this repository. 
+            Summarize differences in a markdown table if asked.
+            ",
         )
-        // auto-retrieve top 3 relevant code snippets for each prompt
-        .dynamic_context(3, index)
+        .dynamic_context(1, index)
         .build();
 
-    // 9. Prompt the agent
-    let query = r#"
-Compare the Python vs. Rust indicators in this repository. 
-Give me a summary in a Markdown table with columns: 
-(Implementation | Inputs | Outputs | Differences).
-"#;
+    info!("Prompting RAG agent");
+    // Prompt the agent and print the response
+    let response = rag_agent.prompt("What does \"glarb-glarb\" mean?").await?;
 
-    // If you have a CLI chatbot utility, you can invoke it here:
-    if let Err(e) = rig::cli_chatbot::cli_chatbot(rag_agent).await {
-        eprintln!("Error: {}", e);
-    }
+    info!("Received response from RAG agent");
+    println!("{}", response);
 
+    info!("RAG agent task completed successfully");
     Ok(())
 }
