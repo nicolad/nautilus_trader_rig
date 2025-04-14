@@ -5,6 +5,7 @@ use rig::{
     embeddings::{Embed, EmbedError, EmbeddingsBuilder, TextEmbedder},
     providers::openai::{Client, TEXT_EMBEDDING_ADA_002},
 };
+use rig::completion::Prompt;
 use rig_sqlite::{Column, ColumnValue, SqliteVectorStore, SqliteVectorStoreTable};
 use rusqlite::ffi::sqlite3_auto_extension;
 use serde::{Deserialize, Serialize};
@@ -208,6 +209,19 @@ async fn main() -> Result<()> {
     let index = vector_store.index(model.clone());
     info!("Vector store indexed. Ready for queries.");
 
+    let rag_agent = openai_client.agent("gpt-4")
+    .preamble("
+        You are a dictionary assistant here to assist the user in understanding the meaning of words.
+        You will find additional non-standard word definitions that could be useful below.
+    ")
+    .dynamic_context(1, index)
+    .build();
+
+      // Prompt the agent and print the response
+    let response = rag_agent.prompt("What does \"glarb-glarb\" mean?").await?;
+    
+    println!("Response: {}", response);
+
 
     // 11. Optional: Summaries
     {
@@ -236,6 +250,8 @@ async fn main() -> Result<()> {
         }
         info!("Wrote a basic summary to collected_code_chunks.txt");
     }
+
+
 
     info!("Embedding and storage process completed successfully");
     Ok(())
