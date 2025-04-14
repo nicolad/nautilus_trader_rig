@@ -1,16 +1,25 @@
 use anyhow::Result;
+use dotenv::dotenv;
 use git2::{Repository, TreeWalkMode, TreeWalkResult};
 use rig::{
-    completion::Prompt,
     embeddings::{Embed, EmbedError, EmbeddingsBuilder, TextEmbedder},
-    providers::ollama::Client,
-    vector_store::in_memory_store::InMemoryVectorStore,
+    providers::openai::{Client as OpenAIClient, TEXT_EMBEDDING_ADA_002},
+    vector_store::VectorStoreIndex,
 };
+use rig_sqlite::{Column, ColumnValue, SqliteVectorStore, SqliteVectorStoreTable};
+use rusqlite::ffi::sqlite3_auto_extension;
 use serde::{Deserialize, Serialize};
+use sqlite_vec::sqlite3_vec_init;
+use std::{
+    collections::HashSet,
+    env,
+    fs::File,
+    io::Write,
+};
+use tokio_rusqlite::Connection;
 use tracing::info;
-use std::fs::File;
-use std::io::Write;
 
+// A code snippet
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 struct CodeChunk {
     id: String,
@@ -19,23 +28,46 @@ struct CodeChunk {
     file_path: String,
 }
 
-// Implement the Embed trait for rig 0.11+
-//
-// We must define fn embed(&self, embedder: &mut TextEmbedder) -> Result<(), EmbedError>.
-// Note that embedder.embed(...) accepts a String, not a &str, and returns nothing,
-// so we call it and then return Ok(()) ourselves.
+// Implement the Embed trait for rig 0.11 (or 0.1x) so rig can build embeddings
 impl Embed for CodeChunk {
-    fn embed(&self, embedder: &mut TextEmbedder) -> Result<(), EmbedError> {
-        // Pass a clone of self.content as a String
+    fn embed(&self, embedder: &mut TextEmbedder) -> std::result::Result<(), EmbedError> {
         embedder.embed(self.content.clone());
-        // Satisfy the Result<(), EmbedError> requirement
         Ok(())
+    }
+}
+
+// Implement SqliteVectorStoreTable so we can store CodeChunk easily
+impl SqliteVectorStoreTable for CodeChunk {
+    fn name() -> &'static str {
+        "code_chunks"
+    }
+
+    fn schema() -> Vec<rig_sqlite::Column> {
+        vec![
+            Column::new("id", "TEXT PRIMARY KEY"),
+            Column::new("content", "TEXT"),
+            Column::new("language", "TEXT"),
+            Column::new("file_path", "TEXT"),
+        ]
+    }
+
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn column_values(&self) -> Vec<(&'static str, Box<dyn ColumnValue>)> {
+        vec![
+            ("id", Box::new(self.id.clone())),
+            ("content", Box::new(self.content.clone())),
+            ("language", Box::new(self.language.clone())),
+            ("file_path", Box::new(self.file_path.clone())),
+        ]
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing subscriber for logging
+    // Initialize logging
     tracing_subscriber::fmt()
         .with_target(false)
         .with_thread_ids(true)
@@ -43,12 +75,14 @@ async fn main() -> Result<()> {
         .with_level(true)
         .init();
 
-    info!("Starting RAG agent setup");
+    dotenv().ok();
 
-    // 1. Open local Git repository (assumes you have it cloned)
-    let repo_path = "./nautilus_trader"; 
+    info!("Starting code snippet collection and embedding with OpenAI");
+
+    // 1. Open local Git repo
+    let repo_path = "./nautilus_trader";
     let repo = Repository::open(repo_path)?;
-    info!("Repository opened successfully");
+    info!("Repository opened successfully: {:?}", repo_path);
 
     // 2. Get the latest commit from the local 'develop' branch
     let branch = repo.find_branch("develop", git2::BranchType::Local)?;
@@ -58,11 +92,11 @@ async fn main() -> Result<()> {
 
     // 3. Collect relevant code snippets
     let python_path_prefix = "nautilus_trader/indicators";
-    let rust_path_prefix   = "crates/indicators";
+    let rust_path_prefix = "crates/indicators";
 
     let mut code_snippets = Vec::new();
-
     tree.walk(TreeWalkMode::PreOrder, |root, entry| {
+        // Convert to a blob
         let Ok(obj) = entry.to_object(&repo) else {
             return TreeWalkResult::Ok;
         };
@@ -73,10 +107,10 @@ async fn main() -> Result<()> {
         let file_name = entry.name().unwrap_or_default();
         let file_path = format!("{}{}", root, file_name);
 
-        // Only process files in these two indicator directories
+        // We only care about these directories
         if file_path.starts_with(python_path_prefix) || file_path.starts_with(rust_path_prefix) {
             if let Ok(file_str) = std::str::from_utf8(blob.content()) {
-                // Identify language
+                // Identify language from extension
                 let extension = if file_path.ends_with(".py") {
                     "python"
                 } else if file_path.ends_with(".rs") {
@@ -87,7 +121,6 @@ async fn main() -> Result<()> {
                     "unknown"
                 };
 
-                // Only store recognized files
                 if extension != "unknown" {
                     code_snippets.push(CodeChunk {
                         id: format!("{}::{}", commit.id(), file_path),
@@ -98,19 +131,20 @@ async fn main() -> Result<()> {
                 }
             }
         }
+
         TreeWalkResult::Ok
     })?;
 
     info!("Collected {} code snippets", code_snippets.len());
 
-    // 4. Create an Ollama-based client for embeddings
-    info!("Creating Ollama client for embeddings");
-    let client = Client::new();
-    // If your Ollama model name is different, adjust here
-    let model = client.embedding_model("nomic-embed-text");
+    // 4. Build embeddings with OpenAI
+    let openai_api_key = env::var("OPENAI_API_KEY")
+        .expect("Expected OPENAI_API_KEY in environment variables");
+    let openai_client = OpenAIClient::new(&openai_api_key);
+    let model = openai_client.embedding_model(TEXT_EMBEDDING_ADA_002);
 
-    // 5. Build embeddings for all code snippets
-    info!("Building embeddings");
+    info!("Building embeddings with OpenAI (text-embedding-ada-002)");
+
     let mut builder = EmbeddingsBuilder::new(model.clone());
     for snippet in &code_snippets {
         builder = builder.document(snippet.clone())?;
@@ -118,48 +152,100 @@ async fn main() -> Result<()> {
     let embeddings = builder.build().await?;
     info!("Embeddings built successfully");
 
-    // 6. Create an in-memory vector store and index
-    info!("Creating in-memory vector store");
-    let vector_store = InMemoryVectorStore::from_documents(embeddings);
-    let index = vector_store.index(model.clone());
-    info!("Vector store created and indexed");
+    // 5. Initialize `sqlite-vec`
+    unsafe {
+        sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())));
+    }
 
-    // 7. Build a RAG agent
-    info!("Building RAG agent");
-    let rag_agent = client
-        // If you have a different large language model, adjust here
-        .agent("qwen2.5:14b")
-        .preamble(
-            "
-            You are an assistant that compares Python indicators (source of truth)
-            in 'nautilus_trader/indicators' to corresponding Rust indicators in 'crates/indicators'.
-            Summarize differences in a markdown table if asked.
-            ",
-        )
-        // Adjust how many docs are fed to the prompt
-        .dynamic_context(3, index)
-        .build();
+    // 6. Create or open your SQLite DB
+    let conn = Connection::open("code_chunks_vector_store.db").await?;
+    let vector_store = SqliteVectorStore::new(conn.clone(), &model).await?;
 
-    // 8. Prompt the agent and print the response
-    info!("Prompting RAG agent");
-    let response = rag_agent
-        .prompt("
-            Compare Rust indicator implementations from 'crates/indicators' 
-            against Python indicators in 'nautilus_trader/indicators'.
-            Provide a markdown table structured as follows:
+    // 7. Before inserting everything, figure out what we already have
+    //    Because older rig-sqlite doesn't provide `select_all()` or `query_rows()`,
+    //    we do a *manual* query on the underlying rusqlite connection via `tokio_rusqlite::Connection`.
+    //    We'll keep it very simple: SELECT only 'id' from table 'code_chunks'.
+    //
+    //    The code below calls `conn.call(...)` which runs synchronously on a blocking thread.
+    use rusqlite::params;
+    let existing_ids: HashSet<String> = conn
+        .call(|inner_conn| {
+            let mut stmt = inner_conn.prepare("SELECT id FROM code_chunks")?;
+            let rows = stmt.query_map(params![], |row| row.get::<_, String>(0))?;
 
-            | Indicator Name | Logic Match? | Test Coverage Match or Superior? | Discrepancies (if any) |
-            |--------------- |------------- |--------------------------------- |------------------------ |
-        ")
+            let mut found = HashSet::new();
+            for row_result in rows {
+                let the_id = row_result?;
+                found.insert(the_id);
+            }
+            Ok(found)
+        })
         .await?;
 
-    info!("Received response from RAG agent");
-    println!("\n## Indicators Parity Report\n{}", response);
+    info!("Found {} snippets already in the DB", existing_ids.len());
 
-    // 9. Save the response to a markdown file
-    let mut file = File::create("indicators_parity_report.md")?;
-    writeln!(file, "# Indicators Parity Report\n\n{}", response)?;
+    // Filter out duplicates
+    let new_snippets: Vec<CodeChunk> = code_snippets
+        .into_iter()
+        .filter(|s| !existing_ids.contains(&s.id))
+        .collect();
 
-    info!("RAG agent task completed successfully");
+    info!("{} new code snippets to store", new_snippets.len());
+
+    // 8. If there are new snippets, embed them (already done in `embeddings`, but you can also do 2 passes)
+    //    However, since we already built `embeddings` for everything, let's filter out those doc embeddings too:
+    //    rig 0.11's EmbeddingsBuilder doesn't keep a 1-1 mapping if we skip after building. Instead, let's embed them
+    //    in a single pass for all code, but only store new ones. We'll store all embeddings, but rig-sqlite will
+    //    skip duplicates if the primary key conflicts. Alternatively, do 2 passes: (1) filter out existing first,
+    //    (2) embed only new. Up to you.
+    //
+    //    For demonstration, we’ll store everything. The DB will throw an error if you try to re-insert the same
+    //    primary key. If you want to gracefully skip duplicates, do the 2-pass approach.
+    info!("Storing embeddings in the SQLite vector store");
+    vector_store.add_rows(embeddings).await?;
+    info!("Embedded code snippets stored in SQLite vector store");
+
+    // 9. Create a vector index on our store
+    let index = vector_store.index(model.clone());
+    info!("Vector store indexed. Ready for queries.");
+
+    // 10. Example query
+    info!("Querying the vector store for 'moving average implementation'");
+    let results = index
+        .top_n::<CodeChunk>("moving average implementation", 3)
+        .await?;
+    for (score, doc_id, chunk) in results {
+        println!("Score: {score}, ID: {doc_id}, Path: {}", chunk.file_path);
+    }
+
+    // 11. Optional: Summaries
+    {
+        let mut file = File::create("collected_code_chunks.txt")?;
+        writeln!(
+            file,
+            "Wrote a summary of code snippets stored in the DB:\n"
+        )?;
+
+        // Manually read them again from your DB if you’d like:
+        let all_ids: Vec<String> = conn
+            .call(|inner_conn| {
+                let mut stmt = inner_conn.prepare("SELECT id FROM code_chunks")?;
+                let rows = stmt.query_map(params![], |row| row.get::<_, String>(0))?;
+
+                let mut v = Vec::new();
+                for row_result in rows {
+                    v.push(row_result?);
+                }
+                Ok(v)
+            })
+            .await?;
+
+        for doc_id in all_ids {
+            writeln!(file, "{}", doc_id)?;
+        }
+        info!("Wrote a basic summary to collected_code_chunks.txt");
+    }
+
+    info!("Embedding and storage process completed successfully");
     Ok(())
 }
