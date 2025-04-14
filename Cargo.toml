@@ -1,0 +1,12 @@
+[package]
+name = "nautilus_trader_rig"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.98"
+futures = "0.3.31"
+git2 = "0.20.1"
+rig-core = { version = "0.11", features = ["all"] }
+serde = "1.0.219"
+tokio = "1.44.2"
