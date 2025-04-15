@@ -3,10 +3,10 @@ use dotenv::dotenv;
 use git2::{ObjectType, Repository, TreeWalkMode, TreeWalkResult};
 use regex::Regex;
 use rig::{
+    completion::Prompt,
     embeddings::{Embed, EmbedError, EmbeddingsBuilder, TextEmbedder},
     providers::openai::{Client, TEXT_EMBEDDING_ADA_002},
 };
-use rig::completion::Prompt;
 use rig_sqlite::{Column, ColumnValue, SqliteVectorStore, SqliteVectorStoreTable};
 use rusqlite::ffi::sqlite3_auto_extension;
 use serde::{Deserialize, Serialize};
@@ -108,65 +108,62 @@ async fn main() -> Result<()> {
     let re_rust_indicator =
         Regex::new(r"(?i)pub\s+struct\s+([A-Za-z_]\w*Indicator)\s*\{").unwrap();
 
-    // We'll define a closure that processes the entries in the git tree
+    // We'll define a closure that processes entries in the git tree
+    // and builds up the code_snippets + indicators vectors.
     let walker_callback = |root: &str, entry: &git2::TreeEntry| {
+        info!(
+            "Examining tree entry: root=\"{}\", name=\"{:?}\"",
+            root,
+            entry.name().unwrap_or_default()
+        );
+
         let Ok(obj) = entry.to_object(&repo) else {
-            info!("Skipping entry because we couldn't convert to object: {:?}", entry.name());
+            info!("Skipping entry: couldn't convert to object => {:?}", entry.name());
             return TreeWalkResult::Ok;
         };
 
-        // We'll log the type (Tree vs Blob vs something else)
         match obj.kind() {
             Some(ObjectType::Tree) => {
-                // It's a sub-tree (directory).
+                // Sub-tree => descend
                 let dir_name = entry.name().unwrap_or_default();
                 let full_dir_path = format!("{}{}", root, dir_name);
                 info!("Descending into subfolder: {full_dir_path}");
                 TreeWalkResult::Ok
             }
             Some(ObjectType::Blob) => {
-                // It's a file. Let’s see if it ends with .py / .pyx / .pxd / .rs / .r
                 let file_name = entry.name().unwrap_or_default();
                 let file_path = format!("{}{}", root, file_name);
                 info!("Found file: {file_path}");
 
-                let extension = if file_path.ends_with(".py") {
+                let file_path_lower = file_path.to_lowercase();
+                let extension = if file_path_lower.ends_with(".py") {
                     "python"
-                } else if file_path.ends_with(".pyx") || file_path.ends_with(".pxd") {
+                } else if file_path_lower.ends_with(".pyx") || file_path_lower.ends_with(".pxd") {
                     "cython"
-                } else if file_path.ends_with(".rs") || file_path.ends_with(".r") {
+                } else if file_path_lower.ends_with(".rs") || file_path_lower.ends_with(".r") {
                     "rust"
                 } else {
                     "unknown"
                 };
 
+                info!("File \"{}\" extension detection => \"{}\"", file_path, extension);
+
                 if extension == "unknown" {
-                    info!("Skipping file with unknown extension: {file_path}");
+                    info!("Skipping unknown extension: {file_path}");
                     return TreeWalkResult::Ok;
                 }
 
                 // Attempt to retrieve the blob content
                 if let Some(blob) = obj.as_blob() {
-                    // Convert raw bytes to str
                     match std::str::from_utf8(blob.content()) {
                         Ok(file_str) => {
-                            // We'll collect the code snippet
-                            code_snippets.push(CodeChunk {
-                                id: format!("{}::{}", commit.id(), file_path),
-                                content: file_str.to_string(),
-                                language: extension.to_string(),
-                                file_path: file_path.clone(),
-                            });
-
-                            info!("Processing file: {file_path}, extension: {extension}, lines: {}", file_str.lines().count());
-
-                            // Now search for indicator definitions
+                            // ---- INDICATOR DETECTION ----
+                            // We'll search the entire file for indicator definitions
                             let lines: Vec<&str> = file_str.lines().collect();
                             let mut found_any_match = false;
 
                             match extension {
                                 "python" => {
-                                    // Python: look for "class X(Indicator):"
                                     for (i, line) in lines.iter().enumerate() {
                                         if let Some(cap) = re_python_indicator.captures(line) {
                                             let indicator_name = cap.get(1).unwrap().as_str();
@@ -184,7 +181,6 @@ async fn main() -> Result<()> {
                                     }
                                 }
                                 "cython" => {
-                                    // Cython: "cdef class X(Indicator):"
                                     for (i, line) in lines.iter().enumerate() {
                                         if let Some(cap) = re_cython_indicator.captures(line) {
                                             let indicator_name = cap.get(1).unwrap().as_str();
@@ -202,7 +198,7 @@ async fn main() -> Result<()> {
                                     }
                                 }
                                 "rust" => {
-                                    // Rust: "pub struct XIndicator {"
+                                    info!("Scanning lines for Rust indicators in: {}", file_path);
                                     for (i, line) in lines.iter().enumerate() {
                                         if let Some(cap) = re_rust_indicator.captures(line) {
                                             let indicator_name = cap.get(1).unwrap().as_str();
@@ -227,6 +223,44 @@ async fn main() -> Result<()> {
                             if !found_any_match {
                                 info!("  No indicator matches found in {}", file_path);
                             }
+
+                            // ---- CHUNKING FOR EMBEDDING ----
+                            // We'll chunk the file text in smaller pieces to avoid
+                            // the 8k token limit in text-embedding-ada-002.
+                            const MAX_LINES_PER_CHUNK: usize = 300;
+                            let total_lines = lines.len();
+                            let mut chunk_start = 0;
+
+                            while chunk_start < total_lines {
+                                let chunk_end =
+                                    std::cmp::min(chunk_start + MAX_LINES_PER_CHUNK, total_lines);
+
+                                let chunk_slice = &lines[chunk_start..chunk_end];
+                                let chunk_content = chunk_slice.join("\n");
+
+                                let chunk_id = format!(
+                                    "{}::{}::chunk_{}_{}",
+                                    commit.id(),
+                                    file_path,
+                                    chunk_start,
+                                    chunk_end
+                                );
+
+                                code_snippets.push(CodeChunk {
+                                    id: chunk_id,
+                                    content: chunk_content,
+                                    language: extension.to_string(),
+                                    file_path: file_path.clone(),
+                                });
+
+                                chunk_start = chunk_end;
+                            }
+
+                            info!("Processed file: {}, lines: {}, total chunks: {}",
+                                  file_path,
+                                  total_lines,
+                                  (total_lines as f64 / MAX_LINES_PER_CHUNK as f64).ceil()
+                            );
                         }
                         Err(e) => {
                             info!("Skipping file (UTF-8 error): {} => {}", file_path, e);
@@ -235,7 +269,6 @@ async fn main() -> Result<()> {
                 } else {
                     info!("Object is not a blob: {file_path}");
                 }
-
                 TreeWalkResult::Ok
             }
             other => {
@@ -250,14 +283,15 @@ async fn main() -> Result<()> {
     info!("Starting recursive tree walk...");
     tree.walk(TreeWalkMode::PreOrder, walker_callback)?;
 
-    info!("Collected {} code snippets", code_snippets.len());
-    info!("Discovered a total of {} potential indicators", indicators.len());
+    info!("Collected {} code snippets (including chunked).", code_snippets.len());
+    info!(
+        "Discovered a total of {} potential indicators.",
+        indicators.len()
+    );
 
     // Write discovered indicators to indicators.csv
     {
-        let mut csv_file =
-            BufWriter::new(File::create("indicators.csv").expect("create indicators.csv failed"));
-        // Header
+        let mut csv_file = BufWriter::new(File::create("indicators.csv")?);
         writeln!(csv_file, "filename,indicator_name,extension")?;
         for (path, name, ext) in &indicators {
             writeln!(csv_file, "{},{},{}", path, name, ext)?;
@@ -317,7 +351,11 @@ async fn main() -> Result<()> {
     }
 
     for (batch_index, chunk) in new_snippets.chunks(BATCH_SIZE).enumerate() {
-        info!("Embedding batch #{} with {} documents...", batch_index + 1, chunk.len());
+        info!(
+            "Embedding batch #{} with {} documents...",
+            batch_index + 1,
+            chunk.len()
+        );
 
         let mut builder = EmbeddingsBuilder::new(model.clone());
         for snippet in chunk {
@@ -325,7 +363,10 @@ async fn main() -> Result<()> {
         }
 
         let embeddings = builder.build().await?;
-        info!("Batch #{} embedded successfully, storing in DB...", batch_index + 1);
+        info!(
+            "Batch #{} embedded successfully, storing in DB...",
+            batch_index + 1
+        );
 
         vector_store.add_rows(embeddings).await?;
         total_embedded += chunk.len();
@@ -344,8 +385,8 @@ async fn main() -> Result<()> {
             You are an assistant that compares the Rust implementation of indicators
             against the Python/Cython implementation. We want a single Markdown table
             with three columns:
-              1) 'Indicator' 
-              2) 'Rust Matches Python?' 
+              1) 'Indicator'
+              2) 'Rust Matches Python?'
               3) 'Rust Test Coverage >= Python?'
             For each relevant indicator, put '✅' if true, '❌' if false.
             If there is incomplete information to decide, you may guess based on partial data.
