@@ -1,7 +1,5 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use dotenv::dotenv;
-use git2::{ObjectType, Repository, TreeWalkMode, TreeWalkResult};
-use regex::Regex;
 use rig::{
     completion::Prompt,
     embeddings::{Embed, EmbedError, EmbeddingsBuilder, TextEmbedder},
@@ -14,29 +12,55 @@ use sqlite_vec::sqlite3_vec_init;
 use std::{
     collections::HashSet,
     env,
-    fs::File,
-    io::{BufWriter, Write},
+    fs::{self, File},
+    io::{BufReader, Write},
+    path::Path,
 };
 use tokio_rusqlite::Connection;
 use tracing::info;
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-struct CodeChunk {
-    id: String,
-    content: String,
-    language: String,
-    file_path: String,
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct IndicatorRow {
+    filename: String,
+    indicator_name: String,
+    extension: String,
+    // This column might not exist in older CSVs, so we make it optional
+    #[serde(default)]
+    embedded: bool,
 }
 
-// Implement the Embed trait so rig can build embeddings
+/// Represents a “chunk” of code to be embedded.
+#[derive(Clone, Debug)]
+pub struct CodeChunk {
+    pub id: String,
+    pub content: String,
+    pub language: String,
+    pub file_path: String,
+}
+
+impl CodeChunk {
+    pub fn new(file_path: &str, content: &str, language: &str) -> Self {
+        // For uniqueness, you might combine path + hash, or something else
+        // Simple approach: path + language
+        let id = format!("{}-{}", file_path, language);
+        CodeChunk {
+            id,
+            content: content.to_string(),
+            language: language.to_string(),
+            file_path: file_path.to_string(),
+        }
+    }
+}
+
+/// Implement the `Embed` trait so `rig` can build embeddings from `CodeChunk`.
 impl Embed for CodeChunk {
-    fn embed(&self, embedder: &mut TextEmbedder) -> std::result::Result<(), EmbedError> {
+    fn embed(&self, embedder: &mut TextEmbedder) -> Result<(), EmbedError> {
         embedder.embed(self.content.clone());
         Ok(())
     }
 }
 
-// Implement SqliteVectorStoreTable so we can store CodeChunk easily
+/// Implement `SqliteVectorStoreTable` so we can store `CodeChunk` in a SQLite table.
 impl SqliteVectorStoreTable for CodeChunk {
     fn name() -> &'static str {
         "code_chunks"
@@ -67,298 +91,123 @@ impl SqliteVectorStoreTable for CodeChunk {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
+    // ------------------------------------------------------------------------
+    // 0. Initialize logging and .env
+    // ------------------------------------------------------------------------
     tracing_subscriber::fmt()
         .with_target(false)
-        .with_thread_ids(true)
         .with_thread_names(true)
         .with_level(true)
         .init();
 
-    dotenv().ok();
-    info!("Starting code snippet collection and embedding with OpenAI");
+    dotenv().ok(); // Load .env if present
+    info!("Starting the embedding process using indicators.csv as a tracker...");
 
-    // 1. Open local Git repo
-    let repo_path = "./nautilus_trader";
-    info!("Attempting to open repository at: {}", repo_path);
-    let repo = Repository::open(repo_path)?;
-    info!("Repository opened successfully: {:?}", repo_path);
+    // ------------------------------------------------------------------------
+    // 1. Load the CSV into memory, parse into a list of IndicatorRow
+    // ------------------------------------------------------------------------
+    let csv_path = "indicators.csv";
+    let mut rows = load_indicators_csv(csv_path)?;
 
-    // 2. Get the latest commit from the local 'develop' branch
-    info!("Looking for branch: 'develop'");
-    let branch = repo.find_branch("develop", git2::BranchType::Local)?;
-    let commit = branch.get().peel_to_commit()?;
-    let tree = commit.tree()?;
-    info!("Got tree from latest commit: {}", commit.id());
-
-    // We'll store code snippets from any .py/.pyx/.pxd/.rs/.r file in the entire repo
-    let mut code_snippets = Vec::new();
-    // We'll also store discovered indicator definitions in a CSV
-    let mut indicators = Vec::new();
-
-    // Regex for Python-based indicators, e.g. "class Foo(Indicator):"
-    let re_python_indicator =
-        Regex::new(r"(?i)^\s*class\s+([A-Za-z_]\w*)\s*\(\s*Indicator\s*\)\s*:").unwrap();
-
-    // Regex for Cython-based indicators, e.g. "cdef class Foo(Indicator):"
-    let re_cython_indicator =
-        Regex::new(r"(?i)^\s*cdef\s+class\s+([A-Za-z_]\w*)\s*\(\s*Indicator\s*\)\s*:").unwrap();
-
-    // Regex for Rust-based indicators, e.g. "pub struct FooIndicator {"
-    let re_rust_indicator =
-        Regex::new(r"(?i)pub\s+struct\s+([A-Za-z_]\w*Indicator)\s*\{").unwrap();
-
-    // We'll define a closure that processes entries in the git tree
-    // and builds up the code_snippets + indicators vectors.
-    let walker_callback = |root: &str, entry: &git2::TreeEntry| {
-        info!(
-            "Examining tree entry: root=\"{}\", name=\"{:?}\"",
-            root,
-            entry.name().unwrap_or_default()
-        );
-
-        let Ok(obj) = entry.to_object(&repo) else {
-            info!("Skipping entry: couldn't convert to object => {:?}", entry.name());
-            return TreeWalkResult::Ok;
-        };
-
-        match obj.kind() {
-            Some(ObjectType::Tree) => {
-                // Sub-tree => descend
-                let dir_name = entry.name().unwrap_or_default();
-                let full_dir_path = format!("{}{}", root, dir_name);
-                info!("Descending into subfolder: {full_dir_path}");
-                TreeWalkResult::Ok
-            }
-            Some(ObjectType::Blob) => {
-                let file_name = entry.name().unwrap_or_default();
-                let file_path = format!("{}{}", root, file_name);
-                info!("Found file: {file_path}");
-
-                let file_path_lower = file_path.to_lowercase();
-                let extension = if file_path_lower.ends_with(".py") {
-                    "python"
-                } else if file_path_lower.ends_with(".pyx") || file_path_lower.ends_with(".pxd") {
-                    "cython"
-                } else if file_path_lower.ends_with(".rs") || file_path_lower.ends_with(".r") {
-                    "rust"
-                } else {
-                    "unknown"
-                };
-
-                info!("File \"{}\" extension detection => \"{}\"", file_path, extension);
-
-                if extension == "unknown" {
-                    info!("Skipping unknown extension: {file_path}");
-                    return TreeWalkResult::Ok;
-                }
-
-                // Attempt to retrieve the blob content
-                if let Some(blob) = obj.as_blob() {
-                    match std::str::from_utf8(blob.content()) {
-                        Ok(file_str) => {
-                            // ---- INDICATOR DETECTION ----
-                            // We'll search the entire file for indicator definitions
-                            let lines: Vec<&str> = file_str.lines().collect();
-                            let mut found_any_match = false;
-
-                            match extension {
-                                "python" => {
-                                    for (i, line) in lines.iter().enumerate() {
-                                        if let Some(cap) = re_python_indicator.captures(line) {
-                                            let indicator_name = cap.get(1).unwrap().as_str();
-                                            indicators.push((
-                                                file_path.clone(),
-                                                indicator_name.to_string(),
-                                                extension.to_string(),
-                                            ));
-                                            info!(
-                                                "  [MATCH] line {} => Found Python indicator: {}",
-                                                i, indicator_name
-                                            );
-                                            found_any_match = true;
-                                        }
-                                    }
-                                }
-                                "cython" => {
-                                    for (i, line) in lines.iter().enumerate() {
-                                        if let Some(cap) = re_cython_indicator.captures(line) {
-                                            let indicator_name = cap.get(1).unwrap().as_str();
-                                            indicators.push((
-                                                file_path.clone(),
-                                                indicator_name.to_string(),
-                                                extension.to_string(),
-                                            ));
-                                            info!(
-                                                "  [MATCH] line {} => Found Cython indicator: {}",
-                                                i, indicator_name
-                                            );
-                                            found_any_match = true;
-                                        }
-                                    }
-                                }
-                                "rust" => {
-                                    info!("Scanning lines for Rust indicators in: {}", file_path);
-                                    for (i, line) in lines.iter().enumerate() {
-                                        if let Some(cap) = re_rust_indicator.captures(line) {
-                                            let indicator_name = cap.get(1).unwrap().as_str();
-                                            indicators.push((
-                                                file_path.clone(),
-                                                indicator_name.to_string(),
-                                                extension.to_string(),
-                                            ));
-                                            info!(
-                                                "  [MATCH] line {} => Found Rust indicator: {}",
-                                                i, indicator_name
-                                            );
-                                            found_any_match = true;
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    // Shouldn't happen, but just in case
-                                }
-                            }
-
-                            if !found_any_match {
-                                info!("  No indicator matches found in {}", file_path);
-                            }
-
-                            // ---- CHUNKING FOR EMBEDDING ----
-                            // We'll chunk the file text in smaller pieces to avoid
-                            // the 8k token limit in text-embedding-ada-002.
-                            const MAX_LINES_PER_CHUNK: usize = 300;
-                            let total_lines = lines.len();
-                            let mut chunk_start = 0;
-
-                            while chunk_start < total_lines {
-                                let chunk_end =
-                                    std::cmp::min(chunk_start + MAX_LINES_PER_CHUNK, total_lines);
-
-                                let chunk_slice = &lines[chunk_start..chunk_end];
-                                let chunk_content = chunk_slice.join("\n");
-
-                                let chunk_id = format!(
-                                    "{}::{}::chunk_{}_{}",
-                                    commit.id(),
-                                    file_path,
-                                    chunk_start,
-                                    chunk_end
-                                );
-
-                                code_snippets.push(CodeChunk {
-                                    id: chunk_id,
-                                    content: chunk_content,
-                                    language: extension.to_string(),
-                                    file_path: file_path.clone(),
-                                });
-
-                                chunk_start = chunk_end;
-                            }
-
-                            info!("Processed file: {}, lines: {}, total chunks: {}",
-                                  file_path,
-                                  total_lines,
-                                  (total_lines as f64 / MAX_LINES_PER_CHUNK as f64).ceil()
-                            );
-                        }
-                        Err(e) => {
-                            info!("Skipping file (UTF-8 error): {} => {}", file_path, e);
-                        }
-                    }
-                } else {
-                    info!("Object is not a blob: {file_path}");
-                }
-                TreeWalkResult::Ok
-            }
-            other => {
-                // Could be a commit, tag, etc. We'll skip
-                info!("Skipping object of type {:?} at entry: {:?}", other, entry.name());
-                TreeWalkResult::Ok
-            }
-        }
-    };
-
-    // Now perform the actual recursive walk of the tree
-    info!("Starting recursive tree walk...");
-    tree.walk(TreeWalkMode::PreOrder, walker_callback)?;
-
-    info!("Collected {} code snippets (including chunked).", code_snippets.len());
-    info!(
-        "Discovered a total of {} potential indicators.",
-        indicators.len()
-    );
-
-    // Write discovered indicators to indicators.csv
-    {
-        let mut csv_file = BufWriter::new(File::create("indicators.csv")?);
-        writeln!(csv_file, "filename,indicator_name,extension")?;
-        for (path, name, ext) in &indicators {
-            writeln!(csv_file, "{},{},{}", path, name, ext)?;
-        }
-        info!("Wrote {} indicators to indicators.csv", indicators.len());
-    }
-
-    // 4. We'll embed in **smaller batches** to avoid invalid request size errors.
+    // ------------------------------------------------------------------------
+    // 2. Prepare OpenAI embedding model
+    // ------------------------------------------------------------------------
     let openai_api_key =
         env::var("OPENAI_API_KEY").expect("Expected OPENAI_API_KEY in environment variables");
     let openai_client = Client::new(&openai_api_key);
     let model = openai_client.embedding_model(TEXT_EMBEDDING_ADA_002);
 
-    info!("Building embeddings in smaller batches with OpenAI (text-embedding-ada-002)");
-
-    // 5. Initialize `sqlite-vec`
+    // ------------------------------------------------------------------------
+    // 3. Setup sqlite-vec for vector storage
+    // ------------------------------------------------------------------------
     unsafe {
         sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())));
     }
 
-    // 6. Create or open your SQLite DB
+    // ------------------------------------------------------------------------
+    // 4. Create/open your SQLite DB
+    // ------------------------------------------------------------------------
     let conn = Connection::open("code_chunks_vector_store.db").await?;
     let vector_store = SqliteVectorStore::new(conn.clone(), &model).await?;
 
-    // 7. Gather existing IDs in the table
-    use rusqlite::params;
-    let existing_ids: HashSet<String> = conn
-        .call(|inner_conn| {
-            let mut stmt = inner_conn.prepare("SELECT id FROM code_chunks")?;
-            let rows = stmt.query_map(params![], |row| row.get::<_, String>(0))?;
-            let mut found = HashSet::new();
-            for row_result in rows {
-                let the_id = row_result?;
-                found.insert(the_id);
+    // ------------------------------------------------------------------------
+    // 5. Gather all existing snippet IDs from DB, so we also skip duplicates
+    // ------------------------------------------------------------------------
+    let existing_ids = fetch_existing_ids(&conn).await?;
+    info!(
+        "Currently have {} code snippet(s) in the DB. Will not re-embed those.",
+        existing_ids.len()
+    );
+
+    // ------------------------------------------------------------------------
+    // 6. For each row in the CSV, if `embedded` is false, read the file,
+    //    build a CodeChunk, and embed it. Then update that CSV row to `embedded = true`.
+    // ------------------------------------------------------------------------
+    let mut to_embed: Vec<CodeChunk> = Vec::new();
+    let mut changed_any = false;
+
+    // We collect everything to embed first, then do it in batches
+    for row in rows.iter_mut() {
+        // Already embedded per CSV? Skip
+        if row.embedded {
+            continue;
+        }
+
+        // Try reading the file for content
+        let file_content = match read_file_contents(&row.filename) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "Warning: Could not read file {} for indicator {}: {:#}",
+                    row.filename, row.indicator_name, e
+                );
+                continue;
             }
-            Ok(found)
-        })
-        .await?;
+        };
 
-    info!("Found {} snippets already in the DB", existing_ids.len());
+        // Build code snippet
+        let language = row.extension.clone(); // "rust", "cython", "python", etc.
+        let snippet = CodeChunk::new(&row.filename, &file_content, &language);
 
-    // Filter out duplicates
-    let new_snippets: Vec<CodeChunk> = code_snippets
-        .into_iter()
-        .filter(|s| !existing_ids.contains(&s.id))
-        .collect();
+        // Check if snippet ID is already in DB
+        if existing_ids.contains(&snippet.id) {
+            info!(
+                "Snippet with ID = {} is already in DB; marking embedded in CSV without re-embedding.",
+                snippet.id
+            );
+            row.embedded = true;
+            changed_any = true;
+            continue;
+        }
 
-    info!("{} new code snippets to store", new_snippets.len());
-
-    // ---- BATCHING LOGIC ----
-    const BATCH_SIZE: usize = 50;
-    let mut total_embedded = 0;
-    if new_snippets.is_empty() {
-        info!("No new snippets to embed. Skipping embedding step.");
-    } else {
-        info!("Beginning embedding in batches of {} documents each.", BATCH_SIZE);
+        // Otherwise, we'll embed
+        to_embed.push(snippet);
     }
 
-    for (batch_index, chunk) in new_snippets.chunks(BATCH_SIZE).enumerate() {
+    // ------------------------------------------------------------------------
+    // 7. Now embed everything in `to_embed` in batches
+    // ------------------------------------------------------------------------
+    const BATCH_SIZE: usize = 50;
+    let total_new = to_embed.len();
+    if total_new == 0 {
+        info!("No new code snippets to embed.");
+    } else {
+        info!(
+            "{} snippet(s) need embedding. Embedding in batches of {}.",
+            total_new, BATCH_SIZE
+        );
+    }
+
+    let mut total_embedded = 0;
+    for (batch_index, chunk_group) in to_embed.chunks(BATCH_SIZE).enumerate() {
         info!(
             "Embedding batch #{} with {} documents...",
             batch_index + 1,
-            chunk.len()
+            chunk_group.len()
         );
 
         let mut builder = EmbeddingsBuilder::new(model.clone());
-        for snippet in chunk {
+        for snippet in chunk_group {
             builder = builder.document(snippet.clone())?;
         }
 
@@ -369,95 +218,175 @@ async fn main() -> Result<()> {
         );
 
         vector_store.add_rows(embeddings).await?;
-        total_embedded += chunk.len();
+        total_embedded += chunk_group.len();
+
+        // Mark them embedded in memory
+        for snippet in chunk_group {
+            // Find the row in `rows` that matches snippet's file path
+            if let Some(ind_row) = rows
+                .iter_mut()
+                .find(|r| r.filename == snippet.file_path && r.embedded == false)
+            {
+                ind_row.embedded = true;
+                changed_any = true;
+            }
+        }
     }
 
-    info!("All batches completed. {} new documents stored.", total_embedded);
+    info!(
+        "All batches completed. {} new documents stored. Updating CSV if needed...",
+        total_embedded
+    );
 
-    // 9. Create a vector index on our store
+    // ------------------------------------------------------------------------
+    // 8. If we set any `embedded=true`, write out the CSV again
+    // ------------------------------------------------------------------------
+    if changed_any {
+        write_indicators_csv(csv_path, &rows)?;
+        info!("Updated {csv_path} with embedded=true for newly embedded files.");
+    } else {
+        info!("No changes in CSV. No rewrite needed.");
+    }
+
+    // ------------------------------------------------------------------------
+    // 9. (Optional) Build your vector store index
+    // ------------------------------------------------------------------------
     let index = vector_store.index(model.clone());
-    info!("Vector store indexed. Ready for queries.");
+    info!("Vector store indexed. Ready for RAG queries if needed.");
 
-    // 10. Use RAG to generate a table comparing Python vs. Rust indicators
     let rag_agent = openai_client
-        .agent("gpt-4")
-        .preamble("
-            You are an assistant that compares the Rust implementation of indicators
-            against the Python/Cython implementation. We want a single Markdown table
-            with three columns:
-              1) 'Indicator'
-              2) 'Rust Matches Python?'
-              3) 'Rust Test Coverage >= Python?'
-            For each relevant indicator, put '✅' if true, '❌' if false.
-            If there is incomplete information to decide, you may guess based on partial data.
-            Format it as valid Markdown.
-        ")
-        .dynamic_context(1, index)
-        .build();
+    .agent("gpt-4")
+    .preamble("
+        You are an assistant that checks parity between Python/Cython indicators
+        and their Rust counterparts. For each indicator, produce a single row in
+        a Markdown table with columns:
+        
+          1) Indicator
+          2) Rust Implementation
+          3) Python/Cython Implementation
+          4) Functional Parity (🟢 or 🔴)
+          5) Test Coverage Parity (🟢 or 🔴)
+          6) Notes
 
-    let comparison_table = rag_agent
-        .prompt("Produce a table comparing all discovered Python vs. Rust indicators for parity and test coverage.")
-        .await?;
+        Keep it concise but thorough. Use the vector store context to find relevant Rust code.
+    ")
+    .dynamic_context(1, index)
+    .build();
 
-    println!("Comparison table:\n{}", comparison_table);
+    let indicators = load_indicators_csv("indicators.csv")?;
 
-    // 11. Write the model's table to a README_comparison.md
-    {
-        let mut comparison_md = File::create("README_comparison.md")?;
-        writeln!(comparison_md, "{}", comparison_table)?;
-        info!("Wrote the model's comparison table to README_comparison.md");
-    }
 
-    // 12. Write out a .txt file summarizing snippet IDs
-    {
-        let mut file = File::create("collected_code_chunks.txt")?;
-        writeln!(file, "Wrote a summary of code snippets stored in the DB:\n")?;
+// 5) Prepare a buffer for our final Markdown output
+    let mut md_output = Vec::new();
 
-        let all_ids: Vec<String> = conn
-            .call(|inner_conn| {
-                let mut stmt = inner_conn.prepare("SELECT id FROM code_chunks")?;
-                let rows = stmt.query_map(params![], |row| row.get::<_, String>(0))?;
-                let mut v = Vec::new();
-                for row_result in rows {
-                    v.push(row_result?);
+        // Write the table header
+        md_output.push("# Indicator Parity Summary".to_string());
+        md_output.push("".to_string());
+        md_output.push("| **Indicator** | **Rust Implementation** | **Python/Cython** | **Functional Parity** | **Test Coverage Parity** | **Notes** |".to_string());
+        md_output.push("|---------------|-------------------------|-------------------|-----------------------|--------------------------|-----------|".to_string());
+    
+        // 6) For each indicator, ask GPT to produce a single table row
+        for ind in &indicators {
+            let user_query = format!(
+                "Indicator name: {}\n\
+                 Python/Cython path: {}\n\
+                 Compare with Rust code, if any, and produce **exactly one** Markdown row.\n\
+                 Use 🟢 for pass, 🔴 for fail.\n",
+                ind.indicator_name,
+                ind.filename
+            );
+
+    
+            // RAG query
+            let response = match rag_agent.prompt(user_query.as_str()).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    eprintln!("Warning: Could not get a response for {}: {:#}", ind.indicator_name, e);
+                    // Fallback row with an error message
+                    format!(
+                        "| {} | (error) | {} | 🔴 | 🔴 | Failed to retrieve info |",
+                        ind.indicator_name, ind.filename
+                    )
                 }
-                Ok(v)
-            })
-            .await?;
-
-        for doc_id in all_ids {
-            writeln!(file, "{}", doc_id)?;
+            };
+    
+            md_output.push(response);
         }
-        info!("Wrote a basic summary to collected_code_chunks.txt");
-    }
-
-    // 13. Optionally keep the “collected_code_chunks.md”
-    {
-        let mut md_file = File::create("collected_code_chunks.md")?;
-        writeln!(md_file, "# Collected Code Chunks\n")?;
-        writeln!(
-            md_file,
-            "Below is a list of code snippet IDs stored in the database:\n"
-        )?;
-
-        let all_ids: Vec<String> = conn
-            .call(|inner_conn| {
-                let mut stmt = inner_conn.prepare("SELECT id FROM code_chunks")?;
-                let rows = stmt.query_map(params![], |row| row.get::<_, String>(0))?;
-                let mut v = Vec::new();
-                for row_result in rows {
-                    v.push(row_result?);
-                }
-                Ok(v)
-            })
-            .await?;
-
-        for doc_id in all_ids {
-            writeln!(md_file, "- `{}`", doc_id)?;
+    
+        // 7) Optionally add an Additional Observations section
+        md_output.push("".to_string());
+        md_output.push("## Additional Observations".to_string());
+        md_output.push("(Place any overarching notes or disclaimers here.)".to_string());
+    
+        // 8) Write everything to a markdown file
+        let mut file = File::create("README_parity.md")?;
+        for line in md_output {
+            writeln!(file, "{}", line)?;
         }
-        info!("Wrote a basic summary to collected_code_chunks.md");
-    }
+    
+        println!("Wrote README_parity.md with the parity comparison table.");
+    
 
-    info!("Embedding, comparison, and storage process completed successfully");
+    // Everything done
     Ok(())
+}
+
+/// Load the entire indicators CSV into a `Vec<IndicatorRow>`.
+/// If the CSV doesn’t have an `embedded` column yet, it will default to `false`.
+fn load_indicators_csv<P: AsRef<Path>>(path: P) -> Result<Vec<IndicatorRow>> {
+    let file = File::open(path.as_ref())
+        .map_err(|e| anyhow!("Failed to open CSV {}: {}", path.as_ref().display(), e))?;
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)        // allow extra/less columns
+        .trim(csv::Trim::All)
+        .from_reader(file);
+
+    let mut rows: Vec<IndicatorRow> = Vec::new();
+    for result in rdr.deserialize() {
+        let record: IndicatorRow = result?;
+        rows.push(record);
+    }
+    Ok(rows)
+}
+
+/// Write out the updated CSV, including the `embedded` column.
+fn write_indicators_csv<P: AsRef<Path>>(path: P, rows: &[IndicatorRow]) -> Result<()> {
+    let mut wtr = csv::WriterBuilder::new()
+        .has_headers(true)
+        .from_path(path.as_ref())?;
+
+    // Write header row manually
+    wtr.write_record(&["filename", "indicator_name", "extension", "embedded"])?;
+
+    for row in rows {
+        wtr.serialize(row)?;
+    }
+    wtr.flush()?;
+    Ok(())
+}
+
+/// Fetch all snippet IDs already in the database.
+async fn fetch_existing_ids(conn: &Connection) -> Result<HashSet<String>> {
+    use rusqlite::params;
+    let ids = conn
+        .call(move |inner_conn| {
+            let mut stmt = inner_conn.prepare("SELECT id FROM code_chunks")?;
+            let rows = stmt.query_map(params![], |row| row.get::<_, String>(0))?;
+
+            let mut found = HashSet::new();
+            for row_result in rows {
+                found.insert(row_result?);
+            }
+            Ok(found)
+        })
+        .await?;
+    Ok(ids)
+}
+
+/// Read file contents as a String, naive version.
+/// Adapt path-building logic as needed for your directory layout.
+fn read_file_contents<P: AsRef<Path>>(path: P) -> Result<String> {
+    let data = fs::read_to_string(path.as_ref())?;
+    Ok(data)
 }
