@@ -1,5 +1,5 @@
-# Comparison for pressure
+# Comparison for dm
 
 | Indicator | Functional Parity (🟢/🔴) | Test Coverage Parity (🟢/🔴) | Notes                                                                                   |
 | --------- | ------------------------- | ---------------------------- | --------------------------------------------------------------------------------------- |
-| Pressure  | 🟢                        | 🟢                           | Full functional parity and test coverage between Rust and Python/Cython implementations |
+| dm        | 🟢                        | 🟢                           | Full functional and test coverage parity between Rust and Python/Cython implementations |

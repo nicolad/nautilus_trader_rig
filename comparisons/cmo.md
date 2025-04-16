@@ -1,5 +1,5 @@
-# Comparison for pressure
+# Comparison for cmo
 
 | Indicator | Functional Parity (🟢/🔴) | Test Coverage Parity (🟢/🔴) | Notes                                                                                   |
 | --------- | ------------------------- | ---------------------------- | --------------------------------------------------------------------------------------- |
-| Pressure  | 🟢                        | 🟢                           | Full functional parity and test coverage between Rust and Python/Cython implementations |
+| cmo       | 🟢                        | 🟢                           | Full functional and test coverage parity between Rust and Python/Cython implementations |

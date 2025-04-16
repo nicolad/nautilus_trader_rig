@@ -1,5 +1,5 @@
-# Comparison for pressure
+# Comparison for vwap
 
 | Indicator | Functional Parity (🟢/🔴) | Test Coverage Parity (🟢/🔴) | Notes                                                                                   |
 | --------- | ------------------------- | ---------------------------- | --------------------------------------------------------------------------------------- |
-| Pressure  | 🟢                        | 🟢                           | Full functional parity and test coverage between Rust and Python/Cython implementations |
+| VWAP      | 🟢                        | 🟢                           | Full functional parity and test coverage between Rust and Python/Cython implementations |

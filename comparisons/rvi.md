@@ -1,5 +1,5 @@
-# Comparison for pressure
+# Comparison for rvi
 
 | Indicator | Functional Parity (🟢/🔴) | Test Coverage Parity (🟢/🔴) | Notes                                                                                   |
 | --------- | ------------------------- | ---------------------------- | --------------------------------------------------------------------------------------- |
-| Pressure  | 🟢                        | 🟢                           | Full functional parity and test coverage between Rust and Python/Cython implementations |
+| RVI       | 🟢                        | 🟢                           | Full functional parity and test coverage between Rust and Python/Cython implementations |

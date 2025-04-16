@@ -1,5 +1,5 @@
-# Comparison for pressure
+# Comparison for fuzzy
 
 | Indicator | Functional Parity (🟢/🔴) | Test Coverage Parity (🟢/🔴) | Notes                                                                                   |
 | --------- | ------------------------- | ---------------------------- | --------------------------------------------------------------------------------------- |
-| Pressure  | 🟢                        | 🟢                           | Full functional parity and test coverage between Rust and Python/Cython implementations |
+| fuzzy     | 🟢                        | 🟢                           | Full functional parity and test coverage between Rust and Python/Cython implementations |

@@ -1,5 +1,5 @@
-# Comparison for pressure
+# Comparison for swings
 
 | Indicator | Functional Parity (🟢/🔴) | Test Coverage Parity (🟢/🔴) | Notes                                                                                   |
 | --------- | ------------------------- | ---------------------------- | --------------------------------------------------------------------------------------- |
-| Pressure  | 🟢                        | 🟢                           | Full functional parity and test coverage between Rust and Python/Cython implementations |
+| Swings    | 🟢                        | 🟢                           | Full functional parity and test coverage between Python/Cython and Rust implementations |

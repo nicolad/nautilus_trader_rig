@@ -1,5 +1,5 @@
-# Comparison for pressure
+# Comparison for vidya
 
 | Indicator | Functional Parity (🟢/🔴) | Test Coverage Parity (🟢/🔴) | Notes                                                                                   |
 | --------- | ------------------------- | ---------------------------- | --------------------------------------------------------------------------------------- |
-| Pressure  | 🟢                        | 🟢                           | Full functional parity and test coverage between Rust and Python/Cython implementations |
+| vidya     | 🟢                        | 🟢                           | Full functional parity and test coverage between Rust and Python/Cython implementations |
