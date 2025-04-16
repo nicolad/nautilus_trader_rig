@@ -64,7 +64,11 @@ a Markdown table with columns:
   5) Test Coverage Parity (🟢 or 🔴)
   6) Notes
 
-Keep it concise but thorough.
+Use '(rust_link)' wherever you want the Rust URL inserted,
+and '(python_link)' for the Python/Cython URL. For example:
+| MyIndicator | (rust_link) | (python_link) | 🟢 | 🟢 | Looks good |
+
+Make sure to provide exactly one table row, using 🟢 or 🔴.
 ",
         )
         .build();
@@ -86,11 +90,6 @@ Keep it concise but thorough.
         );
 
         // Build the full GitHub links for each side:
-        // Example logic (adjust your paths as needed):
-        //  - If extension is "rs", we consider it Rust => crates/indicators/src
-        //  - If extension is "py" or "pxd", we consider it Python/Cython => nautilus_trader/indicators
-        //  - etc.
-
         let rust_link = format!(
             "https://github.com/nautechsystems/nautilus_trader/blob/develop/crates/indicators/src/{}",
             ind.filename
@@ -99,14 +98,10 @@ Keep it concise but thorough.
             "https://github.com/nautechsystems/nautilus_trader/blob/develop/nautilus_trader/indicators/{}",
             ind.filename
         );
-
         debug!("Rust link: {}", rust_link);
         debug!("Python link: {}", python_link);
 
-        // A short helper to choose which link to label “Rust” vs “Python/Cython”
-        // if your CSV lumps them together. You might get more fancy, checking
-        // the extension specifically, or do something else if you store them
-        // differently.
+        // Decide how to treat each extension (rs => Rust, py/pxd => Python, etc.)
         let (python_impl, rust_impl) = match ind.extension.as_str() {
             "rs" => (String::from("(none)"), rust_link),
             "py" | "pxd" => (python_link, String::from("(none)")),
@@ -116,17 +111,17 @@ Keep it concise but thorough.
             ),
         };
 
-        // 4a) Build a direct prompt for the agent
-        //     You could pass the links, so the LLM sees them:
+        // 4a) Build a direct prompt for the agent, letting the LLM know
+        //     we have placeholders (rust_link / python_link) to replace
         let prompt_string = format!(
             "Indicator: {}\n\
              Rust link (if any): {}\n\
              Python/Cython link (if any): {}\n\
-             Produce exactly one row in Markdown.\n\
+             Provide exactly one Markdown row. Use '(rust_link)' and '(python_link)' placeholders \
+             for me to insert final GitHub links.\n\
              Use 🟢 for pass, 🔴 for fail.\n",
             ind.indicator_name, rust_impl, python_impl
         );
-
         debug!("Prompt:\n{}", prompt_string);
 
         // 4b) Prompt the agent for a single row
@@ -137,24 +132,20 @@ Keep it concise but thorough.
                     "Warning: Could not generate row for {}: {}",
                     ind.indicator_name, e
                 );
+                // fallback row, using the link directly or placeholders
                 format!(
-                    "| {} | {} | {} | 🔴 | 🔴 | Request failed |",
+                    "| {} | [Rust Implementation]({}) | [Python/Cython Implementation]({}) | 🔴 | 🔴 | Request failed |",
                     ind.indicator_name, rust_impl, python_impl
                 )
             }
         };
 
-        // 4c) Optionally override or augment the row so it includes your links
-        //     directly in the table (if you want them clickable in the final MD).
-        //
-        //     For example, you might do something like this:
+        // 4c) Insert clickable GitHub links in place of placeholders (if present).
         let final_row = embed_links_in_row(&row, &rust_impl, &python_impl);
 
         // 4d) Write an individual Markdown file for this indicator
-        //     e.g., "comparisons/AMAT.md"
         let indicator_md_path = PathBuf::from("comparisons")
             .join(format!("{}.md", sanitize_filename(&ind.indicator_name)));
-
         {
             let mut f = File::create(&indicator_md_path)?;
             writeln!(f, "# Comparison for {}", ind.indicator_name)?;
@@ -232,24 +223,16 @@ fn sanitize_filename(name: &str) -> String {
     clean
 }
 
-/// Example function that can parse or modify the LLM's row
-/// to insert clickable GitHub links in the table. If the row has placeholders
-/// like `(rust_link)` or `(python_link)`, you can do a string replace, or
-/// fully parse it. This is just an example approach.
+/// Replaces `(rust_link)` and `(python_link)` in `row` with clickable GitHub links.
 fn embed_links_in_row(row: &str, rust_link: &str, python_link: &str) -> String {
-    // Suppose the row from the LLM is something like:
-    // "| AMAT | Rust: (rust_link) | Py: (python_link) | 🟢 | 🟢 | All good |"
-    // We can replace these placeholders or do something more advanced.
-
-    let row_with_links = row
-        .replace(
-            "(rust_link)",
-            format!("[Rust Implementation]({})", rust_link).as_str(),
-        )
-        .replace(
-            "(python_link)",
-            format!("[Python/Cython Implementation]({})", python_link).as_str(),
-        );
-
-    row_with_links
+    // Example row from the agent might be:
+    // "| AMAT | (rust_link) | (python_link) | 🟢 | 🟢 | Looks good |"
+    row.replace(
+        "(rust_link)",
+        &format!("[Rust Implementation]({})", rust_link),
+    )
+    .replace(
+        "(python_link)",
+        &format!("[Python/Cython Implementation]({})", python_link),
+    )
 }
