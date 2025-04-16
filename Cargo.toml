@@ -2,6 +2,7 @@
 name = "nautilus_trader_rig"
 version = "0.1.0"
 edition = "2024"
+default-run = "nautilus_trader_rig"
 
 [dependencies]
 anyhow = "1.0.98"
