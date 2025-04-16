@@ -1,392 +1,185 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
+use csv::ReaderBuilder;
 use dotenv::dotenv;
-use rig::{
-    completion::Prompt,
-    embeddings::{Embed, EmbedError, EmbeddingsBuilder, TextEmbedder},
-    providers::openai::{Client, TEXT_EMBEDDING_ADA_002},
-};
-use rig_sqlite::{Column, ColumnValue, SqliteVectorStore, SqliteVectorStoreTable};
-use rusqlite::ffi::sqlite3_auto_extension;
+use rig::{completion::Prompt, providers::deepseek};
 use serde::{Deserialize, Serialize};
-use sqlite_vec::sqlite3_vec_init;
 use std::{
-    collections::HashSet,
-    env,
-    fs::{self, File},
+    fs::{File, create_dir_all},
     io::{BufReader, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
-use tokio_rusqlite::Connection;
-use tracing::info;
+use tracing::{debug, info};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct IndicatorRow {
     filename: String,
     indicator_name: String,
     extension: String,
-    // This column might not exist in older CSVs, so we make it optional
-    #[serde(default)]
-    embedded: bool,
-}
-
-/// Represents a “chunk” of code to be embedded.
-#[derive(Clone, Debug)]
-pub struct CodeChunk {
-    pub id: String,
-    pub content: String,
-    pub language: String,
-    pub file_path: String,
-}
-
-impl CodeChunk {
-    pub fn new(file_path: &str, content: &str, language: &str) -> Self {
-        // For uniqueness, you might combine path + hash, or something else
-        // Simple approach: path + language
-        let id = format!("{}-{}", file_path, language);
-        CodeChunk {
-            id,
-            content: content.to_string(),
-            language: language.to_string(),
-            file_path: file_path.to_string(),
-        }
-    }
-}
-
-/// Implement the `Embed` trait so `rig` can build embeddings from `CodeChunk`.
-impl Embed for CodeChunk {
-    fn embed(&self, embedder: &mut TextEmbedder) -> Result<(), EmbedError> {
-        embedder.embed(self.content.clone());
-        Ok(())
-    }
-}
-
-/// Implement `SqliteVectorStoreTable` so we can store `CodeChunk` in a SQLite table.
-impl SqliteVectorStoreTable for CodeChunk {
-    fn name() -> &'static str {
-        "code_chunks"
-    }
-
-    fn schema() -> Vec<rig_sqlite::Column> {
-        vec![
-            Column::new("id", "TEXT PRIMARY KEY"),
-            Column::new("content", "TEXT"),
-            Column::new("language", "TEXT"),
-            Column::new("file_path", "TEXT"),
-        ]
-    }
-
-    fn id(&self) -> String {
-        self.id.clone()
-    }
-
-    fn column_values(&self) -> Vec<(&'static str, Box<dyn ColumnValue>)> {
-        vec![
-            ("id", Box::new(self.id.clone())),
-            ("content", Box::new(self.content.clone())),
-            ("language", Box::new(self.language.clone())),
-            ("file_path", Box::new(self.file_path.clone())),
-        ]
-    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // ------------------------------------------------------------------------
-    // 0. Initialize logging and .env
-    // ------------------------------------------------------------------------
+    // Initialize logging + .env
     tracing_subscriber::fmt()
         .with_target(false)
         .with_thread_names(true)
         .with_level(true)
         .init();
-
     dotenv().ok(); // Load .env if present
-    info!("Starting the embedding process using indicators.csv as a tracker...");
 
-    // ------------------------------------------------------------------------
-    // 1. Load the CSV into memory, parse into a list of IndicatorRow
-    // ------------------------------------------------------------------------
+    info!("Starting the indicator comparison process...");
+
+    // 1) Load indicators from CSV
     let csv_path = "indicators.csv";
-    let mut rows = load_indicators_csv(csv_path)?;
+    let indicators = load_indicators_csv(csv_path)?;
+    info!("Loaded {} indicators from {}", indicators.len(), csv_path);
 
-    // ------------------------------------------------------------------------
-    // 2. Prepare OpenAI embedding model
-    // ------------------------------------------------------------------------
-    let openai_api_key =
-        env::var("OPENAI_API_KEY").expect("Expected OPENAI_API_KEY in environment variables");
-    let openai_client = Client::new(&openai_api_key);
-    let model = openai_client.embedding_model(TEXT_EMBEDDING_ADA_002);
+    // 2) Create the “comparisons” folder if it doesn’t exist
+    create_dir_all("comparisons")?;
+    info!("Ensured 'comparisons' folder is present.");
 
-    // ------------------------------------------------------------------------
-    // 3. Setup sqlite-vec for vector storage
-    // ------------------------------------------------------------------------
-    unsafe {
-        sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())));
-    }
+    // 3) Create a DeepSeek client
+    let deepseek_client = deepseek::Client::from_env();
 
-    // ------------------------------------------------------------------------
-    // 4. Create/open your SQLite DB
-    // ------------------------------------------------------------------------
-    let conn = Connection::open("code_chunks_vector_store.db").await?;
-    let vector_store = SqliteVectorStore::new(conn.clone(), &model).await?;
+    // 4) Build an agent to generate Markdown table rows
+    let comparison_agent = deepseek_client
+        .agent(deepseek::DEEPSEEK_REASONER)
+        .preamble(
+            "
+You are an assistant that checks parity between Python/Cython indicators
+and their Rust counterparts. For each indicator, produce a single row in
+a Markdown table with columns:
+  1) Indicator
+  2) Rust Implementation
+  3) Python/Cython Implementation
+  4) Functional Parity (🟢 or 🔴)
+  5) Test Coverage Parity (🟢 or 🔴)
+  6) Notes
 
-    // ------------------------------------------------------------------------
-    // 5. Gather all existing snippet IDs from DB, so we also skip duplicates
-    // ------------------------------------------------------------------------
-    let existing_ids = fetch_existing_ids(&conn).await?;
-    info!(
-        "Currently have {} code snippet(s) in the DB. Will not re-embed those.",
-        existing_ids.len()
-    );
+Keep it concise but thorough.
+",
+        )
+        .build();
+    info!("Comparison agent successfully built.");
 
-    // ------------------------------------------------------------------------
-    // 6. For each row in the CSV, if `embedded` is false, read the file,
-    //    build a CodeChunk, and embed it. Then update that CSV row to `embedded = true`.
-    // ------------------------------------------------------------------------
-    let mut to_embed: Vec<CodeChunk> = Vec::new();
-    let mut changed_any = false;
+    // We’ll accumulate rows for the final combined Markdown
+    let mut all_rows = Vec::new();
 
-    // We collect everything to embed first, then do it in batches
-    for row in rows.iter_mut() {
-        // Already embedded per CSV? Skip
-        if row.embedded {
-            continue;
-        }
+    // 5) Iterate over each indicator
+    for (idx, ind) in indicators.iter().enumerate() {
+        info!(
+            "Processing indicator #{}: {} (file: {}, ext: {})",
+            idx + 1,
+            ind.indicator_name,
+            ind.filename,
+            ind.extension
+        );
 
-        // Try reading the file for content
-        let file_content = match read_file_contents(&row.filename) {
-            Ok(c) => c,
+        // Build the prompt for the agent
+        let prompt_string = format!(
+            "Indicator: {}\n\
+             File path: {}\n\
+             Extension: {}\n\
+             Produce exactly one row in Markdown.\n\
+             Use 🟢 for pass, 🔴 for fail.\n",
+            ind.indicator_name, ind.filename, ind.extension
+        );
+        debug!("Prompt:\n{}", prompt_string);
+
+        // Prompt the agent for a single row
+        let row = match comparison_agent.prompt(prompt_string.as_str()).await {
+            Ok(resp) => resp,
             Err(e) => {
                 eprintln!(
-                    "Warning: Could not read file {} for indicator {}: {:#}",
-                    row.filename, row.indicator_name, e
+                    "Warning: Could not generate parity row for {}: {}",
+                    ind.indicator_name, e
                 );
-                continue;
+                format!(
+                    "| {} | (error) | {} | 🔴 | 🔴 | Request failed |",
+                    ind.indicator_name, ind.filename
+                )
             }
         };
 
-        // Build code snippet
-        let language = row.extension.clone(); // "rust", "cython", "python", etc.
-        let snippet = CodeChunk::new(&row.filename, &file_content, &language);
+        // 5a) Write an individual Markdown file for this indicator
+        //     e.g., "comparisons/IndicatorName.md"
+        //     (You can sanitize the filename if indicator_name might have invalid chars)
+        let indicator_md_path = PathBuf::from("comparisons")
+            .join(format!("{}.md", sanitize_filename(&ind.indicator_name)));
 
-        // Check if snippet ID is already in DB
-        if existing_ids.contains(&snippet.id) {
-            info!(
-                "Snippet with ID = {} is already in DB; marking embedded in CSV without re-embedding.",
-                snippet.id
-            );
-            row.embedded = true;
-            changed_any = true;
-            continue;
+        {
+            // Write a small table with a header + single row
+            let mut f = File::create(&indicator_md_path)?;
+            writeln!(f, "# Comparison for {}", ind.indicator_name)?;
+            writeln!(f)?;
+            writeln!(
+                f,
+                "| **Indicator** | **Rust Implementation** | **Python/Cython** | **Functional Parity** | **Test Coverage Parity** | **Notes** |"
+            )?;
+            writeln!(
+                f,
+                "|---------------|-------------------------|-------------------|-----------------------|--------------------------|-----------|"
+            )?;
+            writeln!(f, "{}", row)?;
         }
+        info!("Wrote individual file: {}", indicator_md_path.display());
 
-        // Otherwise, we'll embed
-        to_embed.push(snippet);
+        // 5b) Save the row for final combined output
+        all_rows.push(row);
     }
 
-    // ------------------------------------------------------------------------
-    // 7. Now embed everything in `to_embed` in batches
-    // ------------------------------------------------------------------------
-    const BATCH_SIZE: usize = 50;
-    let total_new = to_embed.len();
-    if total_new == 0 {
-        info!("No new code snippets to embed.");
-    } else {
-        info!(
-            "{} snippet(s) need embedding. Embedding in batches of {}.",
-            total_new, BATCH_SIZE
-        );
-    }
-
-    let mut total_embedded = 0;
-    for (batch_index, chunk_group) in to_embed.chunks(BATCH_SIZE).enumerate() {
-        info!(
-            "Embedding batch #{} with {} documents...",
-            batch_index + 1,
-            chunk_group.len()
-        );
-
-        let mut builder = EmbeddingsBuilder::new(model.clone());
-        for snippet in chunk_group {
-            builder = builder.document(snippet.clone())?;
-        }
-
-        let embeddings = builder.build().await?;
-        info!(
-            "Batch #{} embedded successfully, storing in DB...",
-            batch_index + 1
-        );
-
-        vector_store.add_rows(embeddings).await?;
-        total_embedded += chunk_group.len();
-
-        // Mark them embedded in memory
-        for snippet in chunk_group {
-            // Find the row in `rows` that matches snippet's file path
-            if let Some(ind_row) = rows
-                .iter_mut()
-                .find(|r| r.filename == snippet.file_path && r.embedded == false)
-            {
-                ind_row.embedded = true;
-                changed_any = true;
-            }
-        }
-    }
-
-    info!(
-        "All batches completed. {} new documents stored. Updating CSV if needed...",
-        total_embedded
-    );
-
-    // ------------------------------------------------------------------------
-    // 8. If we set any `embedded=true`, write out the CSV again
-    // ------------------------------------------------------------------------
-    if changed_any {
-        write_indicators_csv(csv_path, &rows)?;
-        info!("Updated {csv_path} with embedded=true for newly embedded files.");
-    } else {
-        info!("No changes in CSV. No rewrite needed.");
-    }
-
-    // ------------------------------------------------------------------------
-    // 9. (Optional) Build your vector store index
-    // ------------------------------------------------------------------------
-    let index = vector_store.index(model.clone());
-    info!("Vector store indexed. Ready for RAG queries if needed.");
-
-    let rag_agent = openai_client
-    .agent("gpt-4")
-    .preamble("
-        You are an assistant that checks parity between Python/Cython indicators
-        and their Rust counterparts. For each indicator, produce a single row in
-        a Markdown table with columns:
-        
-          1) Indicator
-          2) Rust Implementation
-          3) Python/Cython Implementation
-          4) Functional Parity (🟢 or 🔴)
-          5) Test Coverage Parity (🟢 or 🔴)
-          6) Notes
-
-        Keep it concise but thorough. Use the vector store context to find relevant Rust code.
-    ")
-    .dynamic_context(1, index)
-    .build();
-
-    let indicators = load_indicators_csv("indicators.csv")?;
-
-
-// 5) Prepare a buffer for our final Markdown output
+    // 6) Build the combined Markdown
+    info!("All indicators processed. Building final README_parity.md ...");
     let mut md_output = Vec::new();
+    md_output.push("# Indicator Parity Summary".to_string());
+    md_output.push("".to_string());
+    md_output.push("| **Indicator** | **Rust Implementation** | **Python/Cython** | **Functional Parity** | **Test Coverage Parity** | **Notes** |".to_string());
+    md_output.push("|---------------|-------------------------|-------------------|-----------------------|--------------------------|-----------|".to_string());
 
-        // Write the table header
-        md_output.push("# Indicator Parity Summary".to_string());
-        md_output.push("".to_string());
-        md_output.push("| **Indicator** | **Rust Implementation** | **Python/Cython** | **Functional Parity** | **Test Coverage Parity** | **Notes** |".to_string());
-        md_output.push("|---------------|-------------------------|-------------------|-----------------------|--------------------------|-----------|".to_string());
-    
-        // 6) For each indicator, ask GPT to produce a single table row
-        for ind in &indicators {
-            let user_query = format!(
-                "Indicator name: {}\n\
-                 Python/Cython path: {}\n\
-                 Compare with Rust code, if any, and produce **exactly one** Markdown row.\n\
-                 Use 🟢 for pass, 🔴 for fail.\n",
-                ind.indicator_name,
-                ind.filename
-            );
+    // Add the collected rows
+    md_output.extend(all_rows);
 
-    
-            // RAG query
-            let response = match rag_agent.prompt(user_query.as_str()).await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    eprintln!("Warning: Could not get a response for {}: {:#}", ind.indicator_name, e);
-                    // Fallback row with an error message
-                    format!(
-                        "| {} | (error) | {} | 🔴 | 🔴 | Failed to retrieve info |",
-                        ind.indicator_name, ind.filename
-                    )
-                }
-            };
-    
-            md_output.push(response);
-        }
-    
-        // 7) Optionally add an Additional Observations section
-        md_output.push("".to_string());
-        md_output.push("## Additional Observations".to_string());
-        md_output.push("(Place any overarching notes or disclaimers here.)".to_string());
-    
-        // 8) Write everything to a markdown file
-        let mut file = File::create("README_parity.md")?;
-        for line in md_output {
-            writeln!(file, "{}", line)?;
-        }
-    
-        println!("Wrote README_parity.md with the parity comparison table.");
-    
+    // Optional final notes
+    md_output.push("".to_string());
+    md_output.push("## Additional Observations".to_string());
+    md_output.push("(Place any overarching notes or disclaimers here.)".to_string());
 
-    // Everything done
+    // 7) Write everything to a big MD file
+    let mut file = File::create("README_parity.md")?;
+    for line in md_output {
+        writeln!(file, "{}", line)?;
+    }
+    info!("Wrote README_parity.md with the parity comparison table.");
+
     Ok(())
 }
 
 /// Load the entire indicators CSV into a `Vec<IndicatorRow>`.
-/// If the CSV doesn’t have an `embedded` column yet, it will default to `false`.
 fn load_indicators_csv<P: AsRef<Path>>(path: P) -> Result<Vec<IndicatorRow>> {
+    info!("Attempting to open CSV from: {}", path.as_ref().display());
     let file = File::open(path.as_ref())
         .map_err(|e| anyhow!("Failed to open CSV {}: {}", path.as_ref().display(), e))?;
-    let mut rdr = csv::ReaderBuilder::new()
-        .has_headers(true)
-        .flexible(true)        // allow extra/less columns
-        .trim(csv::Trim::All)
-        .from_reader(file);
 
-    let mut rows: Vec<IndicatorRow> = Vec::new();
+    let mut rdr = ReaderBuilder::new()
+        .has_headers(true)
+        .trim(csv::Trim::All)
+        .from_reader(BufReader::new(file));
+
+    let mut rows = Vec::new();
     for result in rdr.deserialize() {
         let record: IndicatorRow = result?;
         rows.push(record);
     }
+    info!("Finished reading CSV with {} rows of data.", rows.len());
     Ok(rows)
 }
 
-/// Write out the updated CSV, including the `embedded` column.
-fn write_indicators_csv<P: AsRef<Path>>(path: P, rows: &[IndicatorRow]) -> Result<()> {
-    let mut wtr = csv::WriterBuilder::new()
-        .has_headers(true)
-        .from_path(path.as_ref())?;
-
-    // Write header row manually
-    wtr.write_record(&["filename", "indicator_name", "extension", "embedded"])?;
-
-    for row in rows {
-        wtr.serialize(row)?;
-    }
-    wtr.flush()?;
-    Ok(())
-}
-
-/// Fetch all snippet IDs already in the database.
-async fn fetch_existing_ids(conn: &Connection) -> Result<HashSet<String>> {
-    use rusqlite::params;
-    let ids = conn
-        .call(move |inner_conn| {
-            let mut stmt = inner_conn.prepare("SELECT id FROM code_chunks")?;
-            let rows = stmt.query_map(params![], |row| row.get::<_, String>(0))?;
-
-            let mut found = HashSet::new();
-            for row_result in rows {
-                found.insert(row_result?);
-            }
-            Ok(found)
-        })
-        .await?;
-    Ok(ids)
-}
-
-/// Read file contents as a String, naive version.
-/// Adapt path-building logic as needed for your directory layout.
-fn read_file_contents<P: AsRef<Path>>(path: P) -> Result<String> {
-    let data = fs::read_to_string(path.as_ref())?;
-    Ok(data)
+/// Rudimentary function to sanitize a string for use as a filename.
+/// You could make this more robust, e.g., removing spaces or special characters.
+fn sanitize_filename(name: &str) -> String {
+    let mut clean = name.to_string();
+    clean = clean.replace("/", "_");
+    clean = clean.replace("\\", "_");
+    clean = clean.replace(" ", "_");
+    clean
 }
