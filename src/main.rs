@@ -12,16 +12,17 @@ use tracing::{debug, info};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct IndicatorRow {
-    filename: String,       // e.g. "momentum/amat.rs"
-    indicator_name: String, // e.g. "AMAT"
-    extension: String,      // e.g. "rs", "py", "pxd"
+    // e.g. "nautilus_trader/blob/develop/crates/indicators/src/stubs.rs"
+    filename: String,
+    // e.g. "Stubs"
+    indicator_name: String,
+    // e.g. "rs", "py"
+    extension: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // -------------------------------------------------------------------------
     // 0) Init logging + .env
-    // -------------------------------------------------------------------------
     tracing_subscriber::fmt()
         .with_target(false)
         .with_thread_names(true)
@@ -30,31 +31,26 @@ async fn main() -> Result<()> {
     dotenv().ok();
     info!("Starting the indicator comparison process...");
 
-    // -------------------------------------------------------------------------
     // 1) Load the CSV
-    // -------------------------------------------------------------------------
     let csv_path = "indicators.csv";
     let indicators = load_indicators_csv(csv_path)?;
     info!("Loaded {} indicators from {}", indicators.len(), csv_path);
 
-    // -------------------------------------------------------------------------
     // 2) Create the `comparisons` folder
-    // -------------------------------------------------------------------------
     create_dir_all("comparisons")?;
     info!("Ensured 'comparisons' folder is present.");
 
-    // -------------------------------------------------------------------------
     // 3) Create a DeepSeek client + agent
-    // -------------------------------------------------------------------------
     let deepseek_client = DeepSeekClient::from_env();
 
-    // We ask the agent to produce ONE table row, using placeholders `(rust_link)` and `(python_link)`.
+    // This agent expects placeholders (rust_link / python_link),
+    // so it can produce exactly one row of Markdown.
     let comparison_agent = deepseek_client
         .agent("deepseek-chat")
         .preamble(
             "
 You are an assistant that checks parity between Python/Cython indicators
-and their Rust counterparts. For each indicator, produce a single row in
+and their Rust counterparts. For each indicator, produce exactly ONE row in
 a Markdown table with columns:
   1) Indicator
   2) Rust Implementation
@@ -63,10 +59,11 @@ a Markdown table with columns:
   5) Test Coverage Parity (🟢 or 🔴)
   6) Notes
 
-Please place `(rust_link)` and `(python_link)` in the row where you want me to
-insert the GitHub URLs. For example:
+Use '(rust_link)' and '(python_link)' placeholders where you want me to
+inject the actual GitHub URLs (or 'N/A' if there's no recognized extension).
+Example row:
 
-| MyIndicator | (rust_link) | (python_link) | 🟢 | 🟢 | Looks good |
+| MyIndicator | (rust_link) | (python_link) | 🟢 | 🟢 | Some notes |
 
 No double headers—only a single row of data is needed.
 ",
@@ -74,12 +71,10 @@ No double headers—only a single row of data is needed.
         .build();
     info!("Comparison agent successfully built.");
 
-    // Collect rows for final combined table
+    // Accumulate rows for final combined table
     let mut all_rows = Vec::new();
 
-    // -------------------------------------------------------------------------
     // 4) For each indicator, generate individual + combined outputs
-    // -------------------------------------------------------------------------
     for (idx, ind) in indicators.iter().enumerate() {
         info!(
             "Processing #{} => {} (file: {}, ext: {})",
@@ -89,37 +84,31 @@ No double headers—only a single row of data is needed.
             ind.extension
         );
 
-        // Build the full GitHub links
-        let rust_link = format!(
-            "https://github.com/nautechsystems/nautilus_trader/blob/develop/crates/indicators/src/{}",
-            ind.filename
-        );
-        let python_link = format!(
-            "https://github.com/nautechsystems/nautilus_trader/blob/develop/nautilus_trader/indicators/{}",
-            ind.filename
-        );
-        debug!("Rust link: {}", rust_link);
-        debug!("Python link: {}", python_link);
+        // Build full GitHub link by prepending
+        // "https://github.com/nautechsystems/"
+        let full_url = build_github_link(&ind.filename);
+        debug!("Full URL: {}", full_url);
 
         // Decide how to treat each extension
-        // If the file is .rs, we consider it Rust. If .py or .pxd, Python/Cython, etc.
+        //   - If .rs => store the full_url in the Rust column, "N/A" for Python
+        //   - If .py or .pxd => store the full_url in the Python column, "N/A" for Rust
+        //   - If unknown => both columns "N/A"
         let (python_impl, rust_impl) = match ind.extension.as_str() {
-            "rs" => (String::from("(none)"), rust_link),
-            "py" | "pxd" => (python_link, String::from("(none)")),
-            _ => (
-                "(unknown extension)".to_string(),
-                "(unknown extension)".to_string(),
-            ),
+            "rs" => ("N/A".into(), full_url),
+            "py" | "pxd" => (full_url, "N/A".into()),
+            _ => ("N/A".into(), "N/A".into()),
         };
 
         // 4a) Build a prompt for the agent
         let prompt_string = format!(
-            "Indicator: {}\n\
-             Rust link (if any): {}\n\
-             Python/Cython link (if any): {}\n\
-             Produce exactly one row with placeholders '(rust_link)' and '(python_link)' \
-             that I'll replace with actual GitHub URLs.\n\
-             Use 🟢 for pass, 🔴 for fail.\n",
+            "
+Indicator: {}
+Rust link (if any): {}
+Python/Cython link (if any): {}
+Use '(rust_link)' and '(python_link)' placeholders for me to replace. 
+Use 🟢 for pass, 🔴 for fail.
+Make only ONE row of Markdown. 
+",
             ind.indicator_name, rust_impl, python_impl
         );
         debug!("Prompt:\n{}", prompt_string);
@@ -132,7 +121,7 @@ No double headers—only a single row of data is needed.
                     "Warning: Could not generate row for {}: {}",
                     ind.indicator_name, e
                 );
-                // fallback row
+                // fallback row with direct or N/A references
                 format!(
                     "| {} | [Rust Implementation]({}) | [Python/Cython Implementation]({}) | 🔴 | 🔴 | Request failed |",
                     ind.indicator_name, rust_impl, python_impl
@@ -140,21 +129,16 @@ No double headers—only a single row of data is needed.
             }
         };
 
-        // 4c) Insert the clickable GitHub links in place of placeholders
+        // 4c) Insert the clickable GitHub links (or "N/A") in place of placeholders
         let final_row = embed_links_in_row(&row, &rust_impl, &python_impl);
 
         // 4d) Write an individual Markdown file for this indicator
-        // WITHOUT duplicating the header row. We want one set of column headings,
-        // then the data row. No second set of headers.
         let indicator_md_path = PathBuf::from("comparisons")
             .join(format!("{}.md", sanitize_filename(&ind.indicator_name)));
         {
             let mut f = File::create(&indicator_md_path)?;
-            // A short heading
             writeln!(f, "# Comparison for {}", ind.indicator_name)?;
             writeln!(f)?;
-
-            // Single table header
             writeln!(
                 f,
                 "| **Indicator** | **Rust Implementation** | **Python/Cython** | **Functional Parity** | **Test Coverage Parity** | **Notes** |"
@@ -163,8 +147,6 @@ No double headers—only a single row of data is needed.
                 f,
                 "|---------------|-------------------------|-------------------|-----------------------|--------------------------|-----------|"
             )?;
-
-            // Single row for that indicator
             writeln!(f, "{}", final_row)?;
         }
         info!("Wrote individual file: {}", indicator_md_path.display());
@@ -173,9 +155,7 @@ No double headers—only a single row of data is needed.
         all_rows.push(final_row);
     }
 
-    // -------------------------------------------------------------------------
     // 5) Build the big README_parity.md
-    // -------------------------------------------------------------------------
     info!("All indicators processed. Building README_parity.md ...");
     let mut md_output = Vec::new();
     md_output.push("# Indicator Parity Summary".to_string());
@@ -226,21 +206,33 @@ fn load_indicators_csv<P: AsRef<Path>>(path: P) -> Result<Vec<IndicatorRow>> {
     Ok(rows)
 }
 
-/// Replaces `(rust_link)` and `(python_link)` in `row` with clickable GitHub links.
-fn embed_links_in_row(row: &str, rust_link: &str, python_link: &str) -> String {
-    // Example row from the agent:
-    // "| MyIndicator | (rust_link) | (python_link) | 🟢 | 🟢 | All good |"
-    row.replace(
-        "(rust_link)",
-        &format!("[Rust Implementation]({})", rust_link),
-    )
-    .replace(
-        "(python_link)",
-        &format!("[Python/Cython Implementation]({})", python_link),
-    )
+/// Prepend "https://github.com/nautechsystems/" to whatever the CSV's `filename` is.
+/// For example, if the CSV row has `nautilus_trader/blob/develop/crates/indicators/src/stubs.rs`,
+/// the final link is:
+/// `https://github.com/nautechsystems/nautilus_trader/blob/develop/crates/indicators/src/stubs.rs`
+fn build_github_link(filename: &str) -> String {
+    format!("https://github.com/nautechsystems/{}", filename)
 }
 
-/// Rudimentary function to sanitize a string for use as a filename.
+/// Replaces `(rust_link)` and `(python_link)` with either:
+/// `[Rust Implementation](<real-link>)` or `N/A`
+fn embed_links_in_row(row: &str, rust_link: &str, python_link: &str) -> String {
+    let rust_md = if rust_link == "N/A" {
+        "N/A".to_string()
+    } else {
+        format!("[Rust Implementation]({})", rust_link)
+    };
+    let python_md = if python_link == "N/A" {
+        "N/A".to_string()
+    } else {
+        format!("[Python/Cython Implementation]({})", python_link)
+    };
+
+    row.replace("(rust_link)", &rust_md)
+        .replace("(python_link)", &python_md)
+}
+
+/// Simple sanitizer for filenames.
 fn sanitize_filename(name: &str) -> String {
     let mut clean = name.to_string();
     clean = clean.replace("/", "_");
