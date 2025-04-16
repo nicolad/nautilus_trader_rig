@@ -64,17 +64,7 @@
 | SpreadAnalyzer | 🟢 | 🟢 | Both implementations have full functional parity and equivalent test coverage. The Rust version includes additional display formatting and explicit error handling, while the Python/Cython version uses numpy for calculations. |
 | PsychologicalLine (psl) | 🟢 | 🟢 | Full functional and test coverage parity between Python/Cython and Rust implementations |
 | Bollinger Bands | 🟢 | 🔴 | Functional parity achieved, but test coverage parity not yet confirmed |
-| Indicator | Functional Parity (🟢/🔴) | Test Coverage Parity (🟢/🔴) | Notes |
-| ----------- | -------------------------- | -------------------------- | ------- |
-| Indicator | 🔴 | 🔴 | Base abstract class with no concrete implementation to compare |
-| Indicator | Functional Parity (🟢/🔴) | Test Coverage Parity (🟢/🔴) | Notes |
-| ----------- | --------------------------- | ----------------------------- | ------- |
-| **init** | 🔴 | 🔴 | Initialization comparison not applicable |
-| Indicator | Functional Parity (🟢/🔴) | Test Coverage Parity (🟢/🔴) | Notes |
-| ----------- | --------------------------- | ----------------------------- | ------- |
-| **init** | 🔴 | 🔴 | Initialization comparison not applicable as it's a basic constructor |
-| Indicator | Functional Parity (🟢/🔴) | Test Coverage Parity (🟢/🔴) | Notes |
-| ---------- | -------------------------- | ------------------------------ | ------- |
+
 | Indicator | 🔴 | 🔴 | Base abstract class with no concrete implementation to compare |
 | WMA | 🟢 | 🟢 | Both implementations have full functional parity and equivalent test coverage. The Rust version includes additional type safety checks while Python uses NumPy for calculations, but the core logic and test cases match exactly. |
 | sma | 🟢 | 🟢 | Full functional parity with identical behavior and test coverage. Both implementations handle quote ticks, trade ticks, bars, and raw updates similarly. |
