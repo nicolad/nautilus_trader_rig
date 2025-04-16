@@ -4,4 +4,4 @@
 |---------------|-------------------------|-------------------|-----------------------|--------------------------|-----------|
 | Indicator | Rust Implementation | Python/Cython Implementation | Functional Parity | Test Coverage Parity | Notes |
 |-----------|----------------------|-------------------------------|-------------------|-----------------------|-------|
-| psl       | 🔴 (unknown)          | 🔴 (unknown)                   | 🔴                | 🔴                    | No implementation or test coverage found for either language |
+| psl       | ❌ (unknown)         | ❌ (unknown)                  | 🔴                | 🔴                    | No implementation found for either Rust or Python/Cython |
