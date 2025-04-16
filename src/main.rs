@@ -12,12 +12,9 @@ use tracing::{debug, info};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct IndicatorRow {
-    // e.g. "momentum/amat.rs" or "amat.pxd"
-    filename: String,
-    // e.g. "AMAT"
-    indicator_name: String,
-    // e.g. "rs" or "pxd" or "py"
-    extension: String,
+    filename: String,       // e.g. "momentum/amat.rs"
+    indicator_name: String, // e.g. "AMAT"
+    extension: String,      // e.g. "rs", "py", "pxd"
 }
 
 #[tokio::main]
@@ -41,7 +38,7 @@ async fn main() -> Result<()> {
     info!("Loaded {} indicators from {}", indicators.len(), csv_path);
 
     // -------------------------------------------------------------------------
-    // 2) Create the “comparisons” folder
+    // 2) Create the `comparisons` folder
     // -------------------------------------------------------------------------
     create_dir_all("comparisons")?;
     info!("Ensured 'comparisons' folder is present.");
@@ -50,6 +47,8 @@ async fn main() -> Result<()> {
     // 3) Create a DeepSeek client + agent
     // -------------------------------------------------------------------------
     let deepseek_client = DeepSeekClient::from_env();
+
+    // We ask the agent to produce ONE table row, using placeholders `(rust_link)` and `(python_link)`.
     let comparison_agent = deepseek_client
         .agent("deepseek-chat")
         .preamble(
@@ -64,21 +63,22 @@ a Markdown table with columns:
   5) Test Coverage Parity (🟢 or 🔴)
   6) Notes
 
-Use '(rust_link)' wherever you want the Rust URL inserted,
-and '(python_link)' for the Python/Cython URL. For example:
+Please place `(rust_link)` and `(python_link)` in the row where you want me to
+insert the GitHub URLs. For example:
+
 | MyIndicator | (rust_link) | (python_link) | 🟢 | 🟢 | Looks good |
 
-Make sure to provide exactly one table row, using 🟢 or 🔴.
+No double headers—only a single row of data is needed.
 ",
         )
         .build();
     info!("Comparison agent successfully built.");
 
-    // We'll accumulate rows for our final combined Markdown
+    // Collect rows for final combined table
     let mut all_rows = Vec::new();
 
     // -------------------------------------------------------------------------
-    // 4) For each indicator, generate and store individual + combined outputs
+    // 4) For each indicator, generate individual + combined outputs
     // -------------------------------------------------------------------------
     for (idx, ind) in indicators.iter().enumerate() {
         info!(
@@ -89,7 +89,7 @@ Make sure to provide exactly one table row, using 🟢 or 🔴.
             ind.extension
         );
 
-        // Build the full GitHub links for each side:
+        // Build the full GitHub links
         let rust_link = format!(
             "https://github.com/nautechsystems/nautilus_trader/blob/develop/crates/indicators/src/{}",
             ind.filename
@@ -101,7 +101,8 @@ Make sure to provide exactly one table row, using 🟢 or 🔴.
         debug!("Rust link: {}", rust_link);
         debug!("Python link: {}", python_link);
 
-        // Decide how to treat each extension (rs => Rust, py/pxd => Python, etc.)
+        // Decide how to treat each extension
+        // If the file is .rs, we consider it Rust. If .py or .pxd, Python/Cython, etc.
         let (python_impl, rust_impl) = match ind.extension.as_str() {
             "rs" => (String::from("(none)"), rust_link),
             "py" | "pxd" => (python_link, String::from("(none)")),
@@ -111,14 +112,13 @@ Make sure to provide exactly one table row, using 🟢 or 🔴.
             ),
         };
 
-        // 4a) Build a direct prompt for the agent, letting the LLM know
-        //     we have placeholders (rust_link / python_link) to replace
+        // 4a) Build a prompt for the agent
         let prompt_string = format!(
             "Indicator: {}\n\
              Rust link (if any): {}\n\
              Python/Cython link (if any): {}\n\
-             Provide exactly one Markdown row. Use '(rust_link)' and '(python_link)' placeholders \
-             for me to insert final GitHub links.\n\
+             Produce exactly one row with placeholders '(rust_link)' and '(python_link)' \
+             that I'll replace with actual GitHub URLs.\n\
              Use 🟢 for pass, 🔴 for fail.\n",
             ind.indicator_name, rust_impl, python_impl
         );
@@ -132,7 +132,7 @@ Make sure to provide exactly one table row, using 🟢 or 🔴.
                     "Warning: Could not generate row for {}: {}",
                     ind.indicator_name, e
                 );
-                // fallback row, using the link directly or placeholders
+                // fallback row
                 format!(
                     "| {} | [Rust Implementation]({}) | [Python/Cython Implementation]({}) | 🔴 | 🔴 | Request failed |",
                     ind.indicator_name, rust_impl, python_impl
@@ -140,16 +140,21 @@ Make sure to provide exactly one table row, using 🟢 or 🔴.
             }
         };
 
-        // 4c) Insert clickable GitHub links in place of placeholders (if present).
+        // 4c) Insert the clickable GitHub links in place of placeholders
         let final_row = embed_links_in_row(&row, &rust_impl, &python_impl);
 
         // 4d) Write an individual Markdown file for this indicator
+        // WITHOUT duplicating the header row. We want one set of column headings,
+        // then the data row. No second set of headers.
         let indicator_md_path = PathBuf::from("comparisons")
             .join(format!("{}.md", sanitize_filename(&ind.indicator_name)));
         {
             let mut f = File::create(&indicator_md_path)?;
+            // A short heading
             writeln!(f, "# Comparison for {}", ind.indicator_name)?;
             writeln!(f)?;
+
+            // Single table header
             writeln!(
                 f,
                 "| **Indicator** | **Rust Implementation** | **Python/Cython** | **Functional Parity** | **Test Coverage Parity** | **Notes** |"
@@ -158,25 +163,29 @@ Make sure to provide exactly one table row, using 🟢 or 🔴.
                 f,
                 "|---------------|-------------------------|-------------------|-----------------------|--------------------------|-----------|"
             )?;
+
+            // Single row for that indicator
             writeln!(f, "{}", final_row)?;
         }
         info!("Wrote individual file: {}", indicator_md_path.display());
 
-        // 4e) Add to final combined
+        // 4e) Add that row to the final combined table
         all_rows.push(final_row);
     }
 
     // -------------------------------------------------------------------------
-    // 5) Now build the big README_parity.md
+    // 5) Build the big README_parity.md
     // -------------------------------------------------------------------------
     info!("All indicators processed. Building README_parity.md ...");
     let mut md_output = Vec::new();
     md_output.push("# Indicator Parity Summary".to_string());
     md_output.push("".to_string());
+
+    // One table header for the entire summary
     md_output.push("| **Indicator** | **Rust Implementation** | **Python/Cython** | **Functional Parity** | **Test Coverage Parity** | **Notes** |".to_string());
     md_output.push("|---------------|-------------------------|-------------------|-----------------------|--------------------------|-----------|".to_string());
 
-    // Add all accumulated rows
+    // Add all the rows we gathered
     md_output.extend(all_rows);
 
     // Optional final notes
@@ -184,7 +193,7 @@ Make sure to provide exactly one table row, using 🟢 or 🔴.
     md_output.push("## Additional Observations".to_string());
     md_output.push("(Place any overarching notes or disclaimers here.)".to_string());
 
-    // 5b) Write it out
+    // Write out the combined file
     let mut file = File::create("README_parity.md")?;
     for line in md_output {
         writeln!(file, "{}", line)?;
@@ -194,7 +203,10 @@ Make sure to provide exactly one table row, using 🟢 or 🔴.
     Ok(())
 }
 
-/// Load the entire indicators CSV into a `Vec<IndicatorRow>`.
+// =============================================================================
+// Helpers
+// =============================================================================
+
 fn load_indicators_csv<P: AsRef<Path>>(path: P) -> Result<Vec<IndicatorRow>> {
     info!("Attempting to open CSV from: {}", path.as_ref().display());
     let file = File::open(path.as_ref())
@@ -214,19 +226,10 @@ fn load_indicators_csv<P: AsRef<Path>>(path: P) -> Result<Vec<IndicatorRow>> {
     Ok(rows)
 }
 
-/// Minimal “filename sanitizer” to remove or replace certain chars.
-fn sanitize_filename(name: &str) -> String {
-    let mut clean = name.to_string();
-    clean = clean.replace("/", "_");
-    clean = clean.replace("\\", "_");
-    clean = clean.replace(" ", "_");
-    clean
-}
-
 /// Replaces `(rust_link)` and `(python_link)` in `row` with clickable GitHub links.
 fn embed_links_in_row(row: &str, rust_link: &str, python_link: &str) -> String {
-    // Example row from the agent might be:
-    // "| AMAT | (rust_link) | (python_link) | 🟢 | 🟢 | Looks good |"
+    // Example row from the agent:
+    // "| MyIndicator | (rust_link) | (python_link) | 🟢 | 🟢 | All good |"
     row.replace(
         "(rust_link)",
         &format!("[Rust Implementation]({})", rust_link),
@@ -235,4 +238,13 @@ fn embed_links_in_row(row: &str, rust_link: &str, python_link: &str) -> String {
         "(python_link)",
         &format!("[Python/Cython Implementation]({})", python_link),
     )
+}
+
+/// Rudimentary function to sanitize a string for use as a filename.
+fn sanitize_filename(name: &str) -> String {
+    let mut clean = name.to_string();
+    clean = clean.replace("/", "_");
+    clean = clean.replace("\\", "_");
+    clean = clean.replace(" ", "_");
+    clean
 }
