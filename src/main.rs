@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
 You're checking parity between Python/Cython indicators and Rust counterparts.
 
 Output exactly ONE Markdown table row:
-| Indicator | Rust Implementation | Python/Cython Implementation | Functional Parity (🟢/🔴) | Test Coverage Parity (🟢/🔴) | Notes |
+| Indicator | Functional Parity (🟢/🔴) | Test Coverage Parity (🟢/🔴) | Notes |
 ",
         )
         .build();
@@ -64,7 +64,6 @@ Output exactly ONE Markdown table row:
             "
 Indicator: {}
 
-### Rust Implementation:
 {}
 
 ### Python/Cython Implementation:
@@ -99,7 +98,7 @@ Evaluate parity. Output ONE Markdown row.
         writeln!(file, "# Comparison for {}\n", ind.indicator_name)?;
         writeln!(
             file,
-            "| Indicator | Rust Implementation | Python/Cython Implementation | Functional Parity (🟢/🔴) | Test Coverage Parity (🟢/🔴) | Notes |"
+            "| Indicator | Functional Parity (🟢/🔴) | Test Coverage Parity (🟢/🔴) | Notes |"
         )?;
         writeln!(
             file,
@@ -112,7 +111,7 @@ Evaluate parity. Output ONE Markdown row.
     writeln!(readme, "# Indicator Parity Summary\n")?;
     writeln!(
         readme,
-        "| Indicator | Rust Implementation | Python/Cython Implementation | Functional Parity (🟢/🔴) | Test Coverage Parity (🟢/🔴) | Notes |"
+        "| Indicator | Functional Parity (🟢/🔴) | Test Coverage Parity (🟢/🔴) | Notes |"
     )?;
     writeln!(
         readme,
