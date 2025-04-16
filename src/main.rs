@@ -40,10 +40,9 @@ async fn main() -> Result<()> {
         .preamble(
             "
 You're checking parity between Python/Cython indicators and Rust counterparts.
+
 Output exactly ONE Markdown table row:
 | Indicator | Rust Implementation | Python/Cython Implementation | Functional Parity (🟢/🔴) | Test Coverage Parity (🟢/🔴) | Notes |
-
-Use '(rust_link)' and '(python_link)' placeholders.
 ",
         )
         .build();
@@ -71,7 +70,7 @@ Indicator: {}
 ### Python/Cython Implementation:
 {}
 
-Evaluate parity. Use '(rust_link)' and '(python_link)' placeholders. Output ONE Markdown row.
+Evaluate parity. Output ONE Markdown row.
 ",
             ind.indicator_name, rust_content, python_content
         );
@@ -83,13 +82,16 @@ Evaluate parity. Use '(rust_link)' and '(python_link)' placeholders. Output ONE 
             .unwrap_or_else(|e| {
                 error!("Agent error: {}", e);
                 format!(
-                    "| {} | (rust_link) | (python_link) | 🔴 | 🔴 | Agent error |",
+                    "| {} | N/A | N/A | 🔴 | 🔴 | Agent error |",
                     ind.indicator_name
                 )
             });
 
-        let final_row = embed_links(&row, ind, &rust_filepath);
-        all_rows.push(final_row.clone());
+        let clean_row = row
+            .replace("(rust_link)", "Rust Implementation")
+            .replace("(python_link)", "Python/Cython Implementation");
+
+        all_rows.push(clean_row.clone());
 
         let indicator_md =
             PathBuf::from("comparisons").join(format!("{}.md", sanitize(&ind.indicator_name)));
@@ -97,24 +99,24 @@ Evaluate parity. Use '(rust_link)' and '(python_link)' placeholders. Output ONE 
         writeln!(file, "# Comparison for {}\n", ind.indicator_name)?;
         writeln!(
             file,
-            "| Indicator | Rust Implementation | Python/Cython Implementation | Functional Parity | Test Coverage Parity | Notes |"
+            "| Indicator | Rust Implementation | Python/Cython Implementation | Functional Parity (🟢/🔴) | Test Coverage Parity (🟢/🔴) | Notes |"
         )?;
         writeln!(
             file,
-            "|-----------|---------------------|-------------------------------|-------------------|----------------------|-------|"
+            "|-----------|---------------------|-------------------------------|---------------------------|------------------------------|-------|"
         )?;
-        writeln!(file, "{}", final_row)?;
+        writeln!(file, "{}", clean_row)?;
     }
 
     let mut readme = File::create("README_parity.md")?;
     writeln!(readme, "# Indicator Parity Summary\n")?;
     writeln!(
         readme,
-        "| Indicator | Rust Implementation | Python/Cython Implementation | Functional Parity | Test Coverage Parity | Notes |"
+        "| Indicator | Rust Implementation | Python/Cython Implementation | Functional Parity (🟢/🔴) | Test Coverage Parity (🟢/🔴) | Notes |"
     )?;
     writeln!(
         readme,
-        "|-----------|---------------------|-------------------------------|-------------------|----------------------|-------|"
+        "|-----------|---------------------|-------------------------------|---------------------------|------------------------------|-------|"
     )?;
     for row in all_rows {
         writeln!(readme, "{}", row)?;
@@ -137,27 +139,6 @@ fn load_indicators_csv<P: AsRef<Path>>(path: P) -> Result<Vec<IndicatorRow>> {
 
 fn read_file_contents<P: AsRef<Path>>(path: P) -> Result<String> {
     read_to_string(&path).map_err(|e| anyhow!("Error reading {}: {}", path.as_ref().display(), e))
-}
-
-fn embed_links(row: &str, ind: &IndicatorRow, rust_path: &Option<PathBuf>) -> String {
-    let rust_link = rust_path.as_ref().map_or("N/A".into(), |_| {
-        format!("[Rust Implementation]({})", rust_github_link(rust_path))
-    });
-    let python_link = format!("[Python/Cython Implementation]({})", ind.gh_link);
-    row.replace("(rust_link)", &rust_link)
-        .replace("(python_link)", &python_link)
-}
-
-fn rust_github_link(path: &Option<PathBuf>) -> String {
-    path.as_ref()
-        .map(|p| {
-            let p_str = p.display().to_string();
-            format!(
-                "https://github.com/nautechsystems/nautilus_trader/blob/develop/{}",
-                p_str
-            )
-        })
-        .unwrap_or_else(|| "N/A".into())
 }
 
 fn sanitize(name: &str) -> String {
