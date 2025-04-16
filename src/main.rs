@@ -7,6 +7,7 @@ use std::{
     fs::{File, create_dir_all, read_to_string},
     io::{BufReader, Write},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
 };
 use tracing::{debug, error, info};
 
@@ -94,37 +95,63 @@ Evaluate parity. Output ONE Markdown row.
 
         let indicator_md =
             PathBuf::from("comparisons").join(format!("{}.md", sanitize(&ind.indicator_name)));
+
+        let md_content = format!(
+            "# Comparison for {}\n\n\
+             | Indicator | Functional Parity (🟢/🔴) | Test Coverage Parity (🟢/🔴) | Notes |\n\
+             |-----------|---------------------------|-----------------------------|-------|\n\
+             {}\n",
+            ind.indicator_name, clean_row
+        );
+
+        let formatted_md = beautify_markdown(&md_content)?;
+
         let mut file = File::create(&indicator_md)?;
-        writeln!(file, "# Comparison for {}\n", ind.indicator_name)?;
-        writeln!(
-            file,
-            "| Indicator | Functional Parity (🟢/🔴) | Test Coverage Parity (🟢/🔴) | Notes |"
-        )?;
-        writeln!(
-            file,
-            "|-----------|---------------------|-------------------------------|---------------------------|------------------------------|-------|"
-        )?;
-        writeln!(file, "{}", clean_row)?;
+        file.write_all(formatted_md.as_bytes())?;
     }
 
+    let summary_md_header = "# Indicator Parity Summary\n\n\
+    | Indicator | Functional Parity (🟢/🔴) | Test Coverage Parity (🟢/🔴) | Notes |\n\
+    |-----------|---------------------------|-----------------------------|-------|\n";
+
+    let summary_md_content = all_rows.join("\n");
+    let full_readme_md = format!("{}{}\n", summary_md_header, summary_md_content);
+
+    let formatted_summary_md = beautify_markdown(&full_readme_md)?;
+
     let mut readme = File::create("README_parity.md")?;
-    writeln!(readme, "# Indicator Parity Summary\n")?;
-    writeln!(
-        readme,
-        "| Indicator | Functional Parity (🟢/🔴) | Test Coverage Parity (🟢/🔴) | Notes |"
-    )?;
-    writeln!(
-        readme,
-        "|-----------|---------------------|-------------------------------|---------------------------|------------------------------|-------|"
-    )?;
-    for row in all_rows {
-        writeln!(readme, "{}", row)?;
-    }
+    readme.write_all(formatted_summary_md.as_bytes())?;
 
     Ok(())
 }
 
-// --- Helpers ---
+// --- Helper Functions ---
+
+fn beautify_markdown(input: &str) -> Result<String> {
+    let mut child = Command::new("prettier")
+        .args(["--parser", "markdown"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    child
+        .stdin
+        .as_mut()
+        .ok_or(anyhow!("Failed to open stdin"))?
+        .write_all(input.as_bytes())?;
+
+    let output = child.wait_with_output()?;
+
+    if output.status.success() {
+        Ok(String::from_utf8(output.stdout)?)
+    } else {
+        Err(anyhow!(
+            "Prettier failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
 
 fn load_indicators_csv<P: AsRef<Path>>(path: P) -> Result<Vec<IndicatorRow>> {
     let file = File::open(path)?;
@@ -145,43 +172,25 @@ fn sanitize(name: &str) -> String {
 }
 
 fn find_matching_rust(ind: &IndicatorRow) -> Result<Option<PathBuf>> {
-    let candidate_path = format!(
-        "nautilus_trader/crates/indicators/src/momentum/{}.rs",
-        ind.indicator_name
-    );
-    if Path::new(&candidate_path).exists() {
-        return Ok(Some(candidate_path.into()));
-    }
-    let alt_paths = [
-        format!(
-            "nautilus_trader/crates/indicators/src/volatility/{}.rs",
-            ind.indicator_name
-        ),
-        format!(
-            "nautilus_trader/crates/indicators/src/ratio/{}.rs",
-            ind.indicator_name
-        ),
-        format!(
-            "nautilus_trader/crates/indicators/src/book/{}.rs",
-            ind.indicator_name
-        ),
-        format!(
-            "nautilus_trader/crates/indicators/src/average/{}.rs",
-            ind.indicator_name
-        ),
-        format!(
-            "nautilus_trader/crates/indicators/src/python/momentum/{}.rs",
-            ind.indicator_name
-        ),
-        format!(
-            "nautilus_trader/crates/indicators/src/python/average/{}.rs",
-            ind.indicator_name
-        ),
+    let paths = [
+        "momentum",
+        "volatility",
+        "ratio",
+        "book",
+        "average",
+        "python/momentum",
+        "python/average",
     ];
-    for p in alt_paths.iter() {
-        if Path::new(p).exists() {
-            return Ok(Some(p.into()));
+
+    for p in paths.iter() {
+        let candidate_path = format!(
+            "nautilus_trader/crates/indicators/src/{}/{}.rs",
+            p, ind.indicator_name
+        );
+        if Path::new(&candidate_path).exists() {
+            return Ok(Some(candidate_path.into()));
         }
     }
+
     Ok(None)
 }
